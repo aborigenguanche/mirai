@@ -74,9 +74,31 @@ export function UsuariosPage() {
 
   async function handleEdit() {
     setSaving(true);
-    await supabase.from('profiles').update(editForm).eq('id', editProfile.id);
-    toast.success('Usuario actualizado'); setSaving(false); setEditProfile(null); load();
-    if (selected?.id===editProfile.id) setSelected(p=>({...p,...editForm}));
+
+    // Limpiar strings vacíos → null antes de enviar
+    const payload = {
+      ...editForm,
+      subscription_plan:    editForm.subscription_plan    || null,
+      subscription_ends_at: editForm.subscription_ends_at || null,
+      full_name:            editForm.full_name            || null,
+    };
+
+    const { error } = await supabase
+      .from('profiles')
+      .update(payload)
+      .eq('id', editProfile.id);
+
+    if (error) {
+      toast.error('Error al actualizar: ' + error.message);
+      setSaving(false);
+      return;
+    }
+
+    toast.success('Usuario actualizado');
+    setSaving(false);
+    setEditProfile(null);
+    load();
+    if (selected?.id === editProfile.id) setSelected(p => ({ ...p, ...payload }));
   }
 
   async function handleDelete() {
