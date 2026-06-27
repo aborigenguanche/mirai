@@ -2,19 +2,22 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { supabase, getRepasoPendiente, countRepasoPendiente, getMostFailed, fetchSpecialties } from '../../lib/supabase';
 import { useAuthStore } from '../../store';
-import { calcMirScore, calcPercentile, mensajeCoach } from '../../lib/mir-scoring';
 import { Card, CardHeader, StatCard, LoadingScreen } from '../../components/ui';
 
 export default function PlanDiaPage() {
   const { profile }   = useAuthStore();
-  const [loading, setLoading]     = useState(true);
+  const [loading, setLoading]       = useState(true);
   const [pendientes, setPendientes] = useState(0);
-  const [falladasN, setFalladasN] = useState(0);
-  const [weakSpecs, setWeakSpecs] = useState([]);
-  const [analytics, setAnalytics] = useState(null);
-  const [horas, setHoras]         = useState(2);
-  const [racha, setRacha]         = useState(0);
-  const [diasAlMir, setDiasAlMir] = useState(null);
+  // FIX 1: Separado en dos: total real de falladas (para cálculos)
+  // y top falladas (para el link de refuerzo)
+  const [totalFalladas, setTotalFalladas] = useState(0);
+  // FIX 6: Simplificado — solo guardamos la tasa, no el objeto completo
+  const [tasa, setTasa]             = useState(0);
+  // FIX 7: Guardamos { id, name } para poder usar id en las URLs
+  const [weakSpecs, setWeakSpecs]   = useState([]);
+  const [horas, setHoras]           = useState(2);
+  const [racha, setRacha]           = useState(0);
+  const [diasAlMir, setDiasAlMir]   = useState(null);
 
   useEffect(() => { load(); }, []);
 
@@ -22,36 +25,44 @@ export default function PlanDiaPage() {
     setLoading(true);
     const uid = profile.id;
 
-    const [pend, failed, analyticsData, sessHist] = await Promise.all([
+    const [pend, failed, analyticsData, sessHist, falladasCount] = await Promise.all([
       countRepasoPendiente(uid),
       getMostFailed(uid, 5),
       supabase.rpc('get_user_analytics', { p_user_id: uid, p_days: 30 }).then(r => r.data),
+      // FIX 5: Aumentado limit a 120 para cubrir rachas largas con varias sesiones/día
       supabase.from('exam_sessions').select('started_at').eq('user_id', uid)
-        .not('finished_at','is',null).order('started_at',{ascending:false}).limit(60).then(r => r.data||[]),
+        .not('finished_at', 'is', null).order('started_at', { ascending: false }).limit(120).then(r => r.data || []),
+      // FIX 1: Query separada para contar el total real de respuestas falladas
+      supabase.from('exam_responses')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', uid)
+        .eq('is_correct', false)
+        .then(r => r.count || 0),
     ]);
 
     // Racha
     const dias = new Set(sessHist.map(s => new Date(s.started_at).toDateString()));
     let r = 0;
     for (let i = 0; i < 365; i++) {
-      const d = new Date(); d.setDate(d.getDate()-i);
-      if (dias.has(d.toDateString())) r++; else if (i>0) break;
+      const d = new Date(); d.setDate(d.getDate() - i);
+      if (dias.has(d.toDateString())) r++; else if (i > 0) break;
     }
 
     // Días al MIR
     const mirDate = profile.fecha_mir ? new Date(profile.fecha_mir) : null;
     const dMir = mirDate ? Math.max(0, Math.ceil((mirDate - new Date()) / 86400000)) : null;
 
-    // Especialidades débiles del profile
+    // FIX 7: Guardamos { id, name } en lugar de solo name
     const specs = profile.weak_specialties || [];
-    const specNames = await fetchSpecialties().then(all =>
-      all.filter(s => specs.includes(s.id)).map(s => s.name)
+    const specDetails = await fetchSpecialties().then(all =>
+      all.filter(s => specs.includes(s.id)).map(s => ({ id: s.id, name: s.name }))
     );
 
     setPendientes(pend);
-    setFalladasN(failed.length);
-    setWeakSpecs(specNames.slice(0, 3));
-    setAnalytics(analyticsData);
+    setTotalFalladas(falladasCount);
+    // FIX 6: Solo extraemos la tasa del analytics
+    setTasa(analyticsData?.accuracy || 0);
+    setWeakSpecs(specDetails.slice(0, 3));
     setRacha(r);
     setDiasAlMir(dMir);
     setLoading(false);
@@ -62,9 +73,9 @@ export default function PlanDiaPage() {
   const pregsPerH = 25;
   const total     = Math.round(horas * pregsPerH);
   const repaso    = Math.min(pendientes, Math.round(total * 0.4));
-  const errores   = Math.round(total * 0.25);
-  const nuevas    = total - repaso - errores;
-  const tasa      = analytics?.accuracy || 0;
+  // FIX 2: Limitado al total real de falladas, no un porcentaje fijo
+  const errores   = Math.min(totalFalladas, Math.round(total * 0.25));
+  const nuevas    = Math.max(0, total - repaso - errores);
   const hora      = new Date().getHours();
   const saludo    = hora < 12 ? 'Buenos días' : hora < 20 ? 'Buenas tardes' : 'Buenas noches';
   const nombre    = (profile.full_name || profile.email || '').split(' ')[0];
@@ -91,7 +102,7 @@ export default function PlanDiaPage() {
     coachMsg = `Tu tasa es ${tasa}%. Dedica tiempo a entender los conceptos antes de seguir con preguntas nuevas.`;
     coachType = 'alerta';
   } else if (weakSpecs.length > 0) {
-    coachMsg = `Tus especialidades más débiles son ${weakSpecs.join(', ')}. El plan de hoy las prioriza.`;
+    coachMsg = `Tus especialidades más débiles son ${weakSpecs.map(s => s.name).join(', ')}. El plan de hoy las prioriza.`;
     coachType = 'consejo';
   } else if (racha >= 5) {
     coachMsg = `${racha} días de racha 🔥 La constancia es lo que más diferencia a quienes aprueban.`;
@@ -109,6 +120,12 @@ export default function PlanDiaPage() {
     neutro:   { bg:'bg-surface',  border:'border-border',        icon:'📊', text:'text-slate-600' },
   };
   const cs = COACH_STYLE[coachType];
+
+  // FIX 7: URL construida con id de especialidad en lugar del nombre
+  const primeraSpec = weakSpecs[0];
+  const examLinkNuevas = primeraSpec
+    ? `/app/examen?especialidad=${primeraSpec.id}`
+    : '/app/examen';
 
   return (
     <div>
@@ -147,28 +164,40 @@ export default function PlanDiaPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Total hoy"         value={total}           change={`${horas}h disponibles`}    dark />
-        <StatCard label="Repaso SM-2"        value={repaso}          change={`${pendientes} pendientes`} />
-        <StatCard label="Refuerzo errores"   value={errores}         change="preguntas falladas" />
-        <StatCard label="Preguntas nuevas"   value={nuevas}          change="temario nuevo" />
+        <StatCard label="Total hoy"        value={total}   change={`${horas}h disponibles`}            dark />
+        <StatCard label="Repaso SM-2"       value={repaso}  change={`${pendientes} pendientes`} />
+        {/* FIX 2: Muestra el número real basado en totalFalladas */}
+        <StatCard label="Refuerzo errores"  value={errores} change={`${totalFalladas} preguntas falladas`} />
+        <StatCard label="Preguntas nuevas"  value={nuevas}  change="temario nuevo" />
       </div>
 
       {/* Grid principal */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
-        {/* Bloques de trabajo */}
         <div className="lg:col-span-2 flex flex-col gap-4">
           {[
-            { icon:'🔁', title:'Repaso espaciado', desc:'Preguntas programadas por el algoritmo SM-2',
-              count:repaso, color:'pulse', badge:pendientes>0?`${pendientes} pendientes`:'Al día ✓',
+            {
+              icon:'🔁', title:'Repaso espaciado', desc:'Preguntas programadas por el algoritmo SM-2',
+              count:repaso, color:'pulse', badge: pendientes > 0 ? `${pendientes} pendientes` : 'Al día ✓',
               link:'/app/examen?modo=repaso', btnLabel:'Empezar repaso →', btnVariant:'pulse',
-              disabled: pendientes === 0 },
-            { icon:'🎯', title:'Refuerzo de errores', desc:'Preguntas que has fallado más veces',
-              count:errores, color:'amber', badge:`${falladasN} preguntas`,
-              link:'/app/examen?modo=errores', btnLabel:'Practicar errores →', btnVariant:'amber' },
-            { icon:'✨', title:'Preguntas nuevas', desc:`Prioridad: ${weakSpecs[0] || 'todas las especialidades'}`,
+              disabled: pendientes === 0,
+            },
+            {
+              icon:'🎯', title:'Refuerzo de errores', desc:'Preguntas que has fallado más veces',
+              // FIX 2: badge con el total real
+              count:errores, color:'amber', badge:`${totalFalladas} preguntas falladas`,
+              link:'/app/examen?modo=errores', btnLabel:'Practicar errores →', btnVariant:'amber',
+              // FIX 3: Deshabilitado si no hay falladas reales
+              disabled: totalFalladas === 0,
+            },
+            {
+              icon:'✨', title:'Preguntas nuevas', desc: primeraSpec ? `Prioridad: ${primeraSpec.name}` : 'Todas las especialidades',
               count:nuevas, color:'sky', badge:'temario nuevo',
-              link: weakSpecs[0] ? `/app/examen?especialidad=${encodeURIComponent(weakSpecs[0])}` : '/app/examen',
-              btnLabel:`Empezar con ${weakSpecs[0] || 'nuevas preguntas'} →`, btnVariant:'primary' },
+              // FIX 7: URL con id de especialidad
+              link: examLinkNuevas,
+              btnLabel: primeraSpec ? `Empezar con ${primeraSpec.name} →` : 'Empezar con nuevas preguntas →',
+              btnVariant:'primary',
+              disabled: false,
+            },
           ].map(b => (
             <div key={b.title}
               className={`bg-white border border-border rounded-xl p-5 flex items-start gap-4 hover:shadow-md transition-all group ${b.disabled?'opacity-60':''}`}>
@@ -192,7 +221,7 @@ export default function PlanDiaPage() {
                     <span className="text-xs text-slate-400">preguntas</span>
                   </div>
                 </div>
-                {!b.disabled && (
+                {!b.disabled ? (
                   <Link to={b.link}
                     className={`inline-flex items-center gap-2 mt-3 px-4 py-2 rounded-full text-xs font-bold hover:-translate-y-0.5 transition-all ${
                       b.btnVariant==='pulse'?'bg-pulse text-ink hover:brightness-110':
@@ -200,8 +229,11 @@ export default function PlanDiaPage() {
                       'bg-ink text-white hover:shadow-lg'}`}>
                     {b.btnLabel}
                   </Link>
+                ) : (
+                  <span className="text-xs text-pulse-dim font-semibold mt-2 block">
+                    {b.color === 'pulse' ? '✓ Sin repasos pendientes hoy' : '✓ Sin errores registrados aún'}
+                  </span>
                 )}
-                {b.disabled && <span className="text-xs text-pulse-dim font-semibold mt-2 block">✓ Sin repasos pendientes hoy</span>}
               </div>
             </div>
           ))}
@@ -233,9 +265,9 @@ export default function PlanDiaPage() {
                 <div className="text-sm text-slate-500 mb-4">días para el MIR</div>
                 <div className="flex flex-col gap-1.5 text-xs">
                   {[
-                    { label:'Tasa actual', val:`${tasa}%`, ok:tasa>=65 },
-                    { label:'Racha',       val:`${racha} días 🔥`, ok:racha>=3 },
-                    { label:'Sesiones posibles', val:`${diasAlMir} más`, ok:true },
+                    { label:'Tasa actual',        val:`${tasa}%`,         ok: tasa >= 65 },
+                    { label:'Racha',              val:`${racha} días 🔥`, ok: racha >= 3 },
+                    { label:'Sesiones posibles',  val:`${diasAlMir} más`, ok: true },
                   ].map(s => (
                     <div key={s.label} className="flex items-center justify-between">
                       <span className="text-slate-500">{s.label}</span>
@@ -247,7 +279,8 @@ export default function PlanDiaPage() {
             ) : (
               <div>
                 <p className="text-sm text-slate-500 mb-3">Configura tu fecha del MIR para ver la cuenta atrás.</p>
-                <Link to="/app/errores" className={`text-xs font-semibold ${us.text} hover:underline`}>Configurar fecha →</Link>
+                {/* FIX 4: Ruta corregida a perfil, no a errores */}
+                <Link to="/app/perfil" className={`text-xs font-semibold ${us.text} hover:underline`}>Configurar fecha →</Link>
               </div>
             )}
           </div>
@@ -259,11 +292,12 @@ export default function PlanDiaPage() {
               <p className="text-xs text-slate-400 text-center py-4">Practica para ver recomendaciones</p>
             ) : (
               <div className="flex flex-col gap-2">
-                {weakSpecs.map((name, i) => (
-                  <Link key={name} to={`/app/examen?especialidad=${encodeURIComponent(name)}`}
+                {weakSpecs.map((spec, i) => (
+                  // FIX 7: Link con spec.id en lugar del nombre
+                  <Link key={spec.id} to={`/app/examen?especialidad=${spec.id}`}
                     className="flex items-center gap-3 p-3 rounded-lg border border-border hover:border-sky-300 hover:bg-sky-50 transition-all group/item">
                     <div className="w-6 h-6 rounded-full bg-ink flex items-center justify-center font-mono text-xs font-bold text-white shrink-0">{i+1}</div>
-                    <span className="flex-1 text-sm font-medium text-ink">{name}</span>
+                    <span className="flex-1 text-sm font-medium text-ink">{spec.name}</span>
                     <span className="text-slate-300 group-hover/item:text-sky-500 transition-colors text-xs">→</span>
                   </Link>
                 ))}
@@ -276,9 +310,9 @@ export default function PlanDiaPage() {
             <CardHeader title="Tu progreso" />
             <div className="flex flex-col gap-3">
               {[
-                { label:'Tasa de acierto', val:`${tasa}%`, color:tasa>=65?'text-pulse-dim':tasa>=50?'text-amber-500':'text-red-400' },
-                { label:'Racha actual',    val:`${racha} días`, color:racha>=3?'text-amber-500':'text-slate-400' },
-                { label:'Repasos hoy',     val:pendientes, color:pendientes>0?'text-pulse-dim':'text-slate-300' },
+                { label:'Tasa de acierto', val:`${tasa}%`,        color: tasa>=65?'text-pulse-dim':tasa>=50?'text-amber-500':'text-red-400' },
+                { label:'Racha actual',    val:`${racha} días`,   color: racha>=3?'text-amber-500':'text-slate-400' },
+                { label:'Repasos hoy',     val: pendientes,       color: pendientes>0?'text-pulse-dim':'text-slate-300' },
               ].map(s => (
                 <div key={s.label} className="flex items-center justify-between">
                   <span className="text-sm text-slate-500">{s.label}</span>
