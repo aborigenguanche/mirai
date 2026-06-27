@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { supabase } from './lib/supabase'; // ← ajusta la ruta si tu store está en una subcarpeta
 
 // ─── Auth Store ────────────────────────────────────────────
 export const useAuthStore = create((set) => ({
@@ -6,6 +7,20 @@ export const useAuthStore = create((set) => ({
   loading:  true,
   setProfile:   (profile) => set({ profile, loading: false }),
   clearProfile: ()        => set({ profile: null, loading: false }),
+
+  // Recarga el perfil desde Supabase y actualiza el store
+  // Úsalo después de cualquier update de perfil para que toda la app
+  // (PlanDiaPage, Coach IA, navbar...) refleje los datos nuevos
+  refreshProfile: async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+    const { data } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .single();
+    if (data) set({ profile: data, loading: false });
+  },
 }));
 
 // ─── Toast Store ───────────────────────────────────────────
