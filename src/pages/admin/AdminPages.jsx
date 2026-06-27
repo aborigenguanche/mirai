@@ -34,24 +34,52 @@ export function UsuariosPage() {
 
   async function load() {
     setLoading(true);
-    const { data } = await supabase.from('profiles').select('*').order(sortBy, { ascending: sortDir==='asc' });
+    // FIX: Fetch sin orden server-side — el orden se aplica client-side
+    // para que toggleSort funcione sin necesitar re-fetch
+    const { data } = await supabase.from('profiles').select('*');
     setProfiles(data || []);
     setLoading(false);
   }
 
-  const filtrados = profiles.filter(p => {
-    if (filtros.role               && p.role !== filtros.role) return false;
-    if (filtros.subscription_status && p.subscription_status !== filtros.subscription_status) return false;
-    if (filtros.q) { const q = filtros.q.toLowerCase(); if (!p.email?.toLowerCase().includes(q) && !p.full_name?.toLowerCase().includes(q)) return false; }
-    return true;
-  });
-  const totalPags = Math.ceil(filtrados.length / POR_PAGINA);
-  const pagActual = filtrados.slice((pagina-1)*POR_PAGINA, pagina*POR_PAGINA);
-  const f = (k,v) => { setFiltros(p=>({...p,[k]:v})); setPagina(1); };
+  // FIX: Ordenación aplicada client-side sobre los datos ya cargados
+  // Así toggleSort funciona sin tener que volver a llamar a Supabase
+  const filtrados = profiles
+    .filter(p => {
+      if (filtros.role                && p.role !== filtros.role) return false;
+      if (filtros.subscription_status && p.subscription_status !== filtros.subscription_status) return false;
+      if (filtros.q) {
+        const q = filtros.q.toLowerCase();
+        if (!p.email?.toLowerCase().includes(q) && !p.full_name?.toLowerCase().includes(q)) return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      const av = a[sortBy] ?? '';
+      const bv = b[sortBy] ?? '';
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+
+  const pagActual = filtrados.slice((pagina - 1) * POR_PAGINA, pagina * POR_PAGINA);
+  const f = (k, v) => { setFiltros(p => ({ ...p, [k]: v })); setPagina(1); };
 
   function toggleSort(col) {
-    if (sortBy===col) setSortDir(d=>d==='asc'?'desc':'asc'); else { setSortBy(col); setSortDir('desc'); }
+    if (sortBy === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortBy(col); setSortDir('desc'); }
     setPagina(1);
+  }
+
+  // Helper para abrir el modal de edición con todos los campos bien inicializados
+  function openEditModal(p) {
+    setEditProfile(p);
+    setEditForm({
+      full_name:            p.full_name            || '',
+      role:                 p.role,
+      subscription_status:  p.subscription_status,
+      subscription_plan:    p.subscription_plan    || '',
+      // FIX: preservar la fecha real del perfil, no dejarla vacía
+      subscription_ends_at: p.subscription_ends_at ? p.subscription_ends_at.split('T')[0] : '',
+    });
   }
 
   async function openDetail(p) {
@@ -74,38 +102,38 @@ export function UsuariosPage() {
 
   async function handleEdit() {
     setSaving(true);
-  
+
+    // FIX: Limpiar strings vacíos → null y convertir fecha a ISO 8601
+    // Error 22007 (invalid_datetime_format): Supabase rechaza 'YYYY-MM-DD' en
+    // columnas timestamp with time zone; necesita formato ISO completo
     const payload = {
       ...editForm,
-      subscription_plan:    editForm.subscription_plan    || null,
-      subscription_ends_at: editForm.subscription_ends_at || null,
       full_name:            editForm.full_name            || null,
+      subscription_plan:    editForm.subscription_plan    || null,
+      subscription_ends_at: editForm.subscription_ends_at
+        ? new Date(editForm.subscription_ends_at).toISOString()
+        : null,
     };
-  
-    console.log('📤 Payload enviado:', payload);
-    console.log('🎯 ID objetivo:', editProfile.id);
-  
+
     const { data, error } = await supabase
       .from('profiles')
       .update(payload)
       .eq('id', editProfile.id)
-      .select(); // ← fuerza devolver filas afectadas
-  
-    console.log('📥 data:', data);
-    console.log('❌ error:', error);
-  
+      .select(); // FIX: necesario para detectar si RLS bloqueó silenciosamente
+
     if (error) {
-      toast.error('Error Supabase: ' + error.message);
+      toast.error('Error al actualizar: ' + error.message);
       setSaving(false);
       return;
     }
-  
+
+    // FIX: data vacío = RLS bloqueó sin lanzar error
     if (!data || data.length === 0) {
-      toast.error('RLS bloqueó el update — data vacío');
+      toast.error('Sin permisos para actualizar este usuario');
       setSaving(false);
       return;
     }
-  
+
     toast.success('Usuario actualizado');
     setSaving(false);
     setEditProfile(null);
@@ -115,8 +143,21 @@ export function UsuariosPage() {
 
   async function handleDelete() {
     setDeleting(true);
-    await supabase.from('profiles').delete().eq('id', deleteP.id);
-    toast.success('Usuario eliminado'); setDeleting(false); setDeleteP(null); setSelected(null); load();
+
+    // FIX: Añadido manejo de error
+    const { error } = await supabase.from('profiles').delete().eq('id', deleteP.id);
+
+    if (error) {
+      toast.error('Error al eliminar: ' + error.message);
+      setDeleting(false);
+      return;
+    }
+
+    toast.success('Usuario eliminado');
+    setDeleting(false);
+    setDeleteP(null);
+    setSelected(null);
+    load();
   }
 
   async function handleCreate() {
@@ -125,23 +166,46 @@ export function UsuariosPage() {
     if (createForm.password.length < 8) e.password = 'Mínimo 8 caracteres';
     if (Object.keys(e).length) { setCreateErr(e); return; }
     setCreating(true);
-    const { data, error } = await supabase.auth.signUp({ email: createForm.email, password: createForm.password, options:{ data:{ full_name: createForm.full_name } } });
+    const { data, error } = await supabase.auth.signUp({
+      email: createForm.email,
+      password: createForm.password,
+      options: { data: { full_name: createForm.full_name } }
+    });
     if (error) { toast.error(error.message); setCreating(false); return; }
     if (data.user) {
-      await supabase.from('profiles').upsert({ id:data.user.id, email:createForm.email, full_name:createForm.full_name||null, role:createForm.role, subscription_status:createForm.subscription_status });
+      const { error: profileErr } = await supabase.from('profiles').upsert({
+        id:                  data.user.id,
+        email:               createForm.email,
+        full_name:           createForm.full_name || null,
+        role:                createForm.role,
+        subscription_status: createForm.subscription_status,
+      });
+      if (profileErr) { toast.error('Usuario creado pero error en perfil: ' + profileErr.message); }
     }
-    toast.success('Usuario creado'); setCreating(false); setCreateModal(false);
-    setCreateForm({ email:'', full_name:'', password:'', role:'user', subscription_status:'trial' }); setCreateErr({});
+    toast.success('Usuario creado');
+    setCreating(false);
+    setCreateModal(false);
+    setCreateForm({ email:'', full_name:'', password:'', role:'user', subscription_status:'trial' });
+    setCreateErr({});
     load();
   }
 
   async function resetStats(uid) {
     if (!confirm('¿Eliminar todas las estadísticas de este usuario?')) return;
-    await Promise.all([supabase.from('exam_responses').delete().eq('user_id',uid), supabase.from('exam_sessions').delete().eq('user_id',uid)]);
-    toast.success('Estadísticas eliminadas'); openDetail(selected);
+    await Promise.all([
+      supabase.from('exam_responses').delete().eq('user_id', uid),
+      supabase.from('exam_sessions').delete().eq('user_id', uid),
+    ]);
+    toast.success('Estadísticas eliminadas');
+    openDetail(selected);
   }
 
-  const resumen = { total:profiles.length, activos:profiles.filter(p=>p.subscription_status==='active').length, prueba:profiles.filter(p=>p.subscription_status==='trial').length, admins:profiles.filter(p=>p.role==='admin').length };
+  const resumen = {
+    total:    profiles.length,
+    activos:  profiles.filter(p => p.subscription_status === 'active').length,
+    prueba:   profiles.filter(p => p.subscription_status === 'trial').length,
+    admins:   profiles.filter(p => p.role === 'admin').length,
+  };
 
   if (loading) return <LoadingScreen message="Cargando usuarios..." />;
 
@@ -173,12 +237,16 @@ export function UsuariosPage() {
         <select value={filtros.subscription_status} onChange={e=>f('subscription_status',e.target.value)} className="px-3 py-2 border border-border rounded-md text-sm text-slate-600 outline-none bg-white cursor-pointer">
           <option value="">Todos los estados</option><option value="active">Activa</option><option value="trial">Prueba</option><option value="expired">Vencida</option>
         </select>
-        {(filtros.q||filtros.role||filtros.subscription_status) && <button onClick={()=>{setFiltros({q:'',role:'',subscription_status:''});setPagina(1);}} className="text-xs text-slate-400 hover:text-red-500 font-semibold transition-colors">✕ Limpiar</button>}
+        {(filtros.q||filtros.role||filtros.subscription_status) && (
+          <button onClick={()=>{setFiltros({q:'',role:'',subscription_status:''});setPagina(1);}} className="text-xs text-slate-400 hover:text-red-500 font-semibold transition-colors">✕ Limpiar</button>
+        )}
         <span className="ml-auto text-xs text-slate-400 font-mono">{filtrados.length} usuarios</span>
       </div>
 
       <div className="bg-white border border-border rounded-lg overflow-hidden">
-        {pagActual.length===0 ? <EmptyState icon="👥" title="Sin usuarios" action={<Button onClick={()=>setCreateModal(true)} size="sm">+ Crear usuario</Button>} /> : (
+        {pagActual.length === 0 ? (
+          <EmptyState icon="👥" title="Sin usuarios" action={<Button onClick={()=>setCreateModal(true)} size="sm">+ Crear usuario</Button>} />
+        ) : (
           <>
             <div className="overflow-x-auto">
               <table className="w-full">
@@ -200,7 +268,7 @@ export function UsuariosPage() {
                             {(p.full_name||p.email||'U').charAt(0).toUpperCase()}
                           </div>
                           <div>
-                            {p.full_name?<div className="text-sm font-semibold text-ink">{p.full_name}</div>:<div className="text-sm italic text-slate-400">Sin nombre</div>}
+                            {p.full_name ? <div className="text-sm font-semibold text-ink">{p.full_name}</div> : <div className="text-sm italic text-slate-400">Sin nombre</div>}
                             <div className="text-xs text-slate-400 font-mono truncate max-w-[180px]">{p.email}</div>
                           </div>
                         </div>
@@ -212,8 +280,8 @@ export function UsuariosPage() {
                       <td className="px-5 py-3.5">
                         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                           <button onClick={()=>openDetail(p)} className="px-2.5 py-1 text-xs font-semibold text-sky-600 border border-sky-200 rounded-full hover:bg-sky-50 transition-colors">Ver</button>
-                          <button onClick={()=>{setEditProfile(p);setEditForm({full_name:p.full_name||'',role:p.role,subscription_status:p.subscription_status,subscription_plan:p.subscription_plan||'',subscription_ends_at:p.subscription_ends_at?p.subscription_ends_at.split('T')[0]:''});}}
-                            className="w-7 h-7 flex items-center justify-center border border-border rounded-md hover:border-sky-300 hover:bg-sky-50 text-slate-400 hover:text-sky-600 transition-all text-sm">✏️</button>
+                          {/* FIX: usa openEditModal para inicializar correctamente todos los campos */}
+                          <button onClick={()=>openEditModal(p)} className="w-7 h-7 flex items-center justify-center border border-border rounded-md hover:border-sky-300 hover:bg-sky-50 text-slate-400 hover:text-sky-600 transition-all text-sm">✏️</button>
                           <button onClick={()=>setDeleteP(p)} className="w-7 h-7 flex items-center justify-center border border-border rounded-md hover:border-red-200 hover:bg-red-50 text-slate-400 hover:text-red-500 transition-all text-sm">🗑</button>
                         </div>
                       </td>
@@ -229,7 +297,14 @@ export function UsuariosPage() {
 
       {/* Modal detalle */}
       <Modal open={!!selected} onClose={()=>setSelected(null)} title="Detalle del usuario" maxWidth="max-w-2xl"
-        footer={<><Button variant="danger" size="sm" onClick={()=>{setDeleteP(selected);setSelected(null);}}>Eliminar</Button><Button variant="secondary" onClick={()=>{setEditProfile(selected);setEditForm({full_name:selected?.full_name||'',role:selected?.role,subscription_status:selected?.subscription_status,subscription_plan:selected?.subscription_plan||'',subscription_ends_at:''});}}>Editar</Button><Button variant="secondary" onClick={()=>setSelected(null)}>Cerrar</Button></>}>
+        footer={
+          <>
+            <Button variant="danger" size="sm" onClick={()=>{setDeleteP(selected);setSelected(null);}}>Eliminar</Button>
+            {/* FIX: usa openEditModal también desde aquí */}
+            <Button variant="secondary" onClick={()=>openEditModal(selected)}>Editar</Button>
+            <Button variant="secondary" onClick={()=>setSelected(null)}>Cerrar</Button>
+          </>
+        }>
         {selected && (
           <div>
             <div className="flex items-center gap-4 pb-5 mb-5 border-b border-border">
@@ -273,7 +348,7 @@ export function UsuariosPage() {
                     })}
                   </div>
                 </div>
-                {detailSess.length>0 && (
+                {detailSess.length > 0 && (
                   <div>
                     <div className="flex items-center justify-between mb-2">
                       <div className="text-xs font-mono font-semibold uppercase tracking-wider text-slate-400">Últimas sesiones</div>
@@ -309,12 +384,28 @@ export function UsuariosPage() {
         {editProfile && <>
           <FormGroup label="Nombre completo"><Input value={editForm.full_name} onChange={e=>setEditForm(p=>({...p,full_name:e.target.value}))} placeholder="Nombre y apellidos"/></FormGroup>
           <div className="grid grid-cols-2 gap-4">
-            <FormGroup label="Estado suscripción"><Select value={editForm.subscription_status} onChange={e=>setEditForm(p=>({...p,subscription_status:e.target.value}))}><option value="active">Activa</option><option value="trial">Prueba</option><option value="expired">Vencida</option></Select></FormGroup>
-            <FormGroup label="Plan"><Select value={editForm.subscription_plan} onChange={e=>setEditForm(p=>({...p,subscription_plan:e.target.value}))}><option value="">Sin plan</option><option value="monthly">Mensual</option><option value="annual">Anual</option></Select></FormGroup>
+            <FormGroup label="Estado suscripción">
+              <Select value={editForm.subscription_status} onChange={e=>setEditForm(p=>({...p,subscription_status:e.target.value}))}>
+                <option value="active">Activa</option><option value="trial">Prueba</option><option value="expired">Vencida</option>
+              </Select>
+            </FormGroup>
+            <FormGroup label="Plan">
+              <Select value={editForm.subscription_plan} onChange={e=>setEditForm(p=>({...p,subscription_plan:e.target.value}))}>
+                <option value="">Sin plan</option><option value="monthly">Mensual</option><option value="annual">Anual</option>
+              </Select>
+            </FormGroup>
           </div>
-          <FormGroup label="Fin de suscripción" hint="Dejar vacío si no tiene fecha"><Input type="date" value={editForm.subscription_ends_at} onChange={e=>setEditForm(p=>({...p,subscription_ends_at:e.target.value}))}/></FormGroup>
-          <FormGroup label="Rol"><Select value={editForm.role} onChange={e=>setEditForm(p=>({...p,role:e.target.value}))}><option value="user">Usuario</option><option value="admin">Admin</option></Select></FormGroup>
-          {editForm.role==='admin'&&<div className="bg-amber-50 border border-amber-200 rounded-md px-4 py-3 text-xs text-amber-700">⚠️ El rol Admin da acceso completo al panel de administración.</div>}
+          <FormGroup label="Fin de suscripción" hint="Dejar vacío si no tiene fecha">
+            <Input type="date" value={editForm.subscription_ends_at} onChange={e=>setEditForm(p=>({...p,subscription_ends_at:e.target.value}))}/>
+          </FormGroup>
+          <FormGroup label="Rol">
+            <Select value={editForm.role} onChange={e=>setEditForm(p=>({...p,role:e.target.value}))}>
+              <option value="user">Usuario</option><option value="admin">Admin</option>
+            </Select>
+          </FormGroup>
+          {editForm.role==='admin' && (
+            <div className="bg-amber-50 border border-amber-200 rounded-md px-4 py-3 text-xs text-amber-700">⚠️ El rol Admin da acceso completo al panel de administración.</div>
+          )}
         </>}
       </Modal>
 
@@ -336,7 +427,12 @@ export function UsuariosPage() {
         <div className="text-center py-2">
           <div className="text-4xl mb-3">⚠️</div>
           <p className="text-sm text-slate-500 mb-4">¿Seguro que quieres eliminar este usuario? Se borrarán todos sus datos. <strong>Esta acción no se puede deshacer.</strong></p>
-          {deleteP&&<div className="bg-surface border border-border rounded-lg p-3 text-left"><div className="text-sm font-semibold text-ink">{deleteP.full_name||<span className="italic text-slate-400">Sin nombre</span>}</div><div className="text-xs text-slate-400 font-mono">{deleteP.email}</div></div>}
+          {deleteP && (
+            <div className="bg-surface border border-border rounded-lg p-3 text-left">
+              <div className="text-sm font-semibold text-ink">{deleteP.full_name||<span className="italic text-slate-400">Sin nombre</span>}</div>
+              <div className="text-xs text-slate-400 font-mono">{deleteP.email}</div>
+            </div>
+          )}
         </div>
       </Modal>
     </div>
@@ -344,7 +440,7 @@ export function UsuariosPage() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Admin NotificacionesPage
+// Admin NotificacionesPage — sin cambios
 // ═══════════════════════════════════════════════════════════
 export function NotificacionesPage() {
   const [profiles, setProfiles] = useState([]);
@@ -381,8 +477,8 @@ export function NotificacionesPage() {
     setSending(true);
     let userIds = [];
     if (form.target === 'all') userIds = [];
-    else if (form.target === 'trial') userIds = profiles.filter(p=>p.subscription_status==='trial').map(p=>p.id);
-    else if (form.target === 'active') userIds = profiles.filter(p=>p.subscription_status==='active').map(p=>p.id);
+    else if (form.target === 'trial')   userIds = profiles.filter(p=>p.subscription_status==='trial').map(p=>p.id);
+    else if (form.target === 'active')  userIds = profiles.filter(p=>p.subscription_status==='active').map(p=>p.id);
     else if (form.target === 'expired') userIds = profiles.filter(p=>p.subscription_status==='expired').map(p=>p.id);
     await sendNotification({ userIds, title:form.title, body:form.body, type:form.type });
     setSending(false); setSent(true);
@@ -409,7 +505,6 @@ export function NotificacionesPage() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        {/* Formulario */}
         <Card>
           <CardHeader title="Nueva notificación" subtitle="Se entregará en tiempo real en la app" />
           <FormGroup label="Título" required error={errors.title}>
@@ -439,8 +534,6 @@ export function NotificacionesPage() {
               </Select>
             </FormGroup>
           </div>
-
-          {/* Preview */}
           <div className="bg-surface border border-border rounded-xl p-4 mb-5">
             <div className="text-xs font-mono font-semibold uppercase tracking-wider text-slate-400 mb-3">Preview</div>
             <div className="flex items-start gap-3 p-3 bg-ink rounded-lg">
@@ -451,13 +544,11 @@ export function NotificacionesPage() {
               </div>
             </div>
           </div>
-
           <Button fullWidth onClick={handleSend} loading={sending} variant={sent?'pulse':'primary'}>
             {sent ? '✓ Enviada correctamente' : `Enviar a ${form.target==='all'?'todos los usuarios':TARGET_COUNTS[form.target]+' usuarios'}`}
           </Button>
         </Card>
 
-        {/* Historial */}
         <div>
           <Card padding={false}>
             <div className="p-5 border-b border-border">
@@ -492,7 +583,7 @@ export function NotificacionesPage() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Admin AnalyticsPage
+// Admin AnalyticsPage — sin cambios
 // ═══════════════════════════════════════════════════════════
 export function AnalyticsPage() {
   const [loading, setLoading] = useState(true);
@@ -522,12 +613,10 @@ export function AnalyticsPage() {
     const uniqueUsers = new Set(ss.map(s=>s.user_id)).size;
     const avgQperSess = ss.length ? Math.round(ss.reduce((a,s)=>a+(s.total_questions||0),0)/ss.length) : 0;
 
-    // Retención: usuarios con sesión en los últimos 7 días
     const hace7 = new Date(Date.now()-7*86400000).toISOString();
     const activeRecent = new Set((ss||[]).filter(s=>s.started_at>=hace7).map(s=>s.user_id)).size;
     const retention = uniqueUsers ? Math.round((activeRecent/uniqueUsers)*100) : 0;
 
-    // Crecimiento diario de usuarios
     const dias = Math.min(parseInt(periodo), 30);
     const crecimiento = Array.from({length:dias},(_,i)=>{
       const d=new Date(); d.setDate(d.getDate()-(dias-1-i));
@@ -535,10 +624,7 @@ export function AnalyticsPage() {
       return { dia:d.toLocaleDateString('es-ES',{day:'2-digit',month:'short'}), nuevos: ps.filter(p=>new Date(p.created_at).toDateString()===dayStr).length };
     });
 
-    // Distribución por modo
     const modos = ss.reduce((a,s)=>{ a[s.mode]=(a[s.mode]||0)+1; return a; }, {});
-
-    // Score MIR distribution
     const scores = (rankings||[]).map(r=>parseFloat(r.score)||0);
     const avgScore = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : 0;
 
@@ -567,7 +653,6 @@ export function AnalyticsPage() {
         </div>
       </div>
 
-      {/* KPIs principales */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         {[
           { label:'Preguntas respondidas', val:data.total.toLocaleString('es-ES'), change:`${data.corr} correctas · ${data.tasa}%`, type:'neutral', dark:true },
@@ -584,9 +669,7 @@ export function AnalyticsPage() {
         ))}
       </div>
 
-      {/* Grid analytics */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
-        {/* Crecimiento de usuarios */}
         <div className="lg:col-span-2">
           <Card>
             <CardHeader title="Nuevos usuarios por día" subtitle={`Últimos ${Math.min(parseInt(periodo),30)} días`} />
@@ -611,9 +694,7 @@ export function AnalyticsPage() {
           </Card>
         </div>
 
-        {/* Panel derecho */}
         <div className="flex flex-col gap-5">
-          {/* Distribución suscripciones */}
           <Card>
             <CardHeader title="Distribución de usuarios" />
             <div className="flex flex-col gap-3">
@@ -637,7 +718,6 @@ export function AnalyticsPage() {
             </div>
           </Card>
 
-          {/* Modos de uso */}
           <Card>
             <CardHeader title="Modos más usados" />
             {Object.entries(data.modos).length===0 ? <p className="text-xs text-slate-400 text-center py-4">Sin datos</p> : (
@@ -660,7 +740,6 @@ export function AnalyticsPage() {
             )}
           </Card>
 
-          {/* Score MIR medio */}
           <Card>
             <CardHeader title="Score MIR global" subtitle="Media de todos los simulacros" />
             <div className="text-center py-4">
@@ -679,7 +758,6 @@ export function AnalyticsPage() {
         </div>
       </div>
 
-      {/* Retención */}
       <Card>
         <CardHeader title="Métricas de retención y engagement" subtitle="Usuarios que vuelven a practicar" />
         <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
