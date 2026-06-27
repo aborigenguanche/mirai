@@ -74,26 +74,38 @@ export function UsuariosPage() {
 
   async function handleEdit() {
     setSaving(true);
-
-    // Limpiar strings vacíos → null antes de enviar
+  
     const payload = {
       ...editForm,
       subscription_plan:    editForm.subscription_plan    || null,
       subscription_ends_at: editForm.subscription_ends_at || null,
       full_name:            editForm.full_name            || null,
     };
-
-    const { error } = await supabase
+  
+    console.log('📤 Payload enviado:', payload);
+    console.log('🎯 ID objetivo:', editProfile.id);
+  
+    const { data, error } = await supabase
       .from('profiles')
       .update(payload)
-      .eq('id', editProfile.id);
-
+      .eq('id', editProfile.id)
+      .select(); // ← fuerza devolver filas afectadas
+  
+    console.log('📥 data:', data);
+    console.log('❌ error:', error);
+  
     if (error) {
-      toast.error('Error al actualizar: ' + error.message);
+      toast.error('Error Supabase: ' + error.message);
       setSaving(false);
       return;
     }
-
+  
+    if (!data || data.length === 0) {
+      toast.error('RLS bloqueó el update — data vacío');
+      setSaving(false);
+      return;
+    }
+  
     toast.success('Usuario actualizado');
     setSaving(false);
     setEditProfile(null);
