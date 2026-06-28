@@ -2,15 +2,16 @@ import { useState, useEffect, useRef } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
   supabase, fetchQuestions, fetchQuestionsByIds, createSession, finishSession,
-  saveResponses, getRepasoPendiente, getMostFailed, upsertQuestionState, getNote, upsertNote
+  saveResponses, getRepasoPendiente, getMostFailed, getNote, upsertNote
+  // upsertQuestionState eliminado — ahora se hace en batch directamente
 } from '../../lib/supabase';
 import { useAuthStore, useExamStore, toast } from '../../store';
 import { classifyError, calcQuality, sm2, MIR_CONFIG, calcMirScore } from '../../lib/mir-scoring';
 import { Button, Badge, Spinner, ScoreRing, Card } from '../../components/ui';
 
 export default function ExamenPage() {
-  const { profile }   = useAuthStore();
-  const exam          = useExamStore();
+  const { profile }    = useAuthStore();
+  const exam           = useExamStore();
   const [searchParams] = useSearchParams();
   const modoUrl        = searchParams.get('modo') || 'study';
   const espUrl         = searchParams.get('especialidad') || '';
@@ -38,37 +39,69 @@ export default function ExamenPage() {
   async function persistSession() {
     const { correct, wrong, blank } = exam.getStats();
     const score = calcMirScore({ correct, wrong, blank });
-    await finishSession({ sessionId: exam.sessionId, numCorrect: correct, numWrong: wrong, numBlank: blank, score });
 
+    // Construir filas de respuestas
     const responseRows = exam.questions.map(q => {
       const r = exam.getResponse(q.id) || { letter: null, isCorrect: false, timeSecs: 0 };
-      const errorType = classifyError(r.isCorrect, q.correct_option_letter, r.letter, r.timeSecs);
       return {
-        session_id: exam.sessionId, question_id: q.id,
-        user_id: profile.id,
-        selected_option_letter: r.letter,
-        is_correct: r.isCorrect,
-        time_taken_seconds: r.timeSecs,
+        session_id:              exam.sessionId,
+        question_id:             q.id,
+        user_id:                 profile.id,
+        selected_option_letter:  r.letter,
+        is_correct:              r.isCorrect,
+        time_taken_seconds:      r.timeSecs,
       };
     });
-    await saveResponses(responseRows);
 
-    // Actualizar SM-2
-    for (const q of exam.questions) {
-      const r   = exam.getResponse(q.id);
-      if (!r) continue;
-      const { data: existing } = await supabase.from('user_question_state')
-        .select('*').eq('user_id', profile.id).eq('question_id', q.id).maybeSingle();
-      const quality   = calcQuality(r.isCorrect, r.timeSecs || 30);
-      const newState  = sm2(existing || {}, quality);
-      const errorType = classifyError(r.isCorrect, q.correct_option_letter, r.letter, r.timeSecs);
-      await upsertQuestionState(profile.id, q.id, {
-        ...newState,
-        last_error_type: errorType || (existing?.last_error_type),
-        times_wrong:   (existing?.times_wrong  || 0) + (r.isCorrect ? 0 : 1),
-        times_correct: (existing?.times_correct || 0) + (r.isCorrect ? 1 : 0),
-      });
+    // Guardar sesión y respuestas en paralelo
+    await Promise.all([
+      finishSession({ sessionId: exam.sessionId, numCorrect: correct, numWrong: wrong, numBlank: blank, score }),
+      saveResponses(responseRows),
+    ]);
+
+    // ─── FIX SM-2: Batch en 2 requests en lugar de 2N ─────────────────
+    // Antes: un SELECT + un UPSERT por pregunta = 40 requests para 20 preguntas
+    // Ahora: 1 SELECT de todas + 1 UPSERT de todas = 2 requests siempre
+    // Esto es fundamental con 30k preguntas en el banco
+    const questionIds = exam.questions.map(q => q.id);
+
+    const { data: existingStates } = await supabase
+      .from('user_question_state')
+      .select('*')
+      .eq('user_id', profile.id)
+      .in('question_id', questionIds);
+
+    // Mapa { question_id → estado actual } para lookup O(1)
+    const stateMap = Object.fromEntries(
+      (existingStates || []).map(s => [s.question_id, s])
+    );
+
+    const sm2Rows = exam.questions
+      .map(q => {
+        const r = exam.getResponse(q.id);
+        if (!r) return null;
+        const existing  = stateMap[q.id] || {};
+        const quality   = calcQuality(r.isCorrect, r.timeSecs || 30);
+        const newState  = sm2(existing, quality);
+        const errorType = classifyError(r.isCorrect, q.correct_option_letter, r.letter, r.timeSecs);
+        return {
+          user_id:         profile.id,
+          question_id:     q.id,
+          ...newState,
+          last_error_type: errorType || existing.last_error_type || null,
+          times_wrong:     (existing.times_wrong  || 0) + (r.isCorrect ? 0 : 1),
+          times_correct:   (existing.times_correct || 0) + (r.isCorrect ? 1 : 0),
+          updated_at:      new Date().toISOString(),
+        };
+      })
+      .filter(Boolean);
+
+    if (sm2Rows.length > 0) {
+      await supabase
+        .from('user_question_state')
+        .upsert(sm2Rows, { onConflict: 'user_id,question_id' });
     }
+    // ───────────────────────────────────────────────────────────────────
   }
 
   async function handleStart() {
@@ -84,13 +117,17 @@ export default function ExamenPage() {
       const failed = await getMostFailed(profile.id, cfg.numQuestions);
       questions = failed.map(f => f.question).filter(Boolean);
     } else {
-      questions = await fetchQuestions({ specialtyId: cfg.specialtyId, difficulty: cfg.difficulty ? parseInt(cfg.difficulty) : undefined, limit: cfg.numQuestions });
+      questions = await fetchQuestions({
+        specialtyId: cfg.specialtyId,
+        difficulty: cfg.difficulty ? parseInt(cfg.difficulty) : undefined,
+        limit: cfg.numQuestions,
+      });
     }
 
     if (!questions.length) { setSetupErr('No hay preguntas disponibles con estos filtros.'); setLoadingStart(false); return; }
 
     const session = await createSession({
-      userId: profile.id, mode: cfg.mode === 'study' ? 'study' : 'study',
+      userId: profile.id, mode: 'study',
       specialtyFilter: cfg.specialtyId ? [cfg.specialtyId] : [],
       totalQuestions: questions.length, timeLimitMinutes: null,
     });
@@ -118,9 +155,9 @@ function Setup({ onStart, loading, error, modoUrl, espUrl }) {
   }, []);
 
   const MODOS = [
-    { key:'study',   label:'Estudio',   desc:'Explicación tras cada respuesta',  icon:'📖' },
-    { key:'errores', label:'Errores',   desc:'Preguntas que más has fallado',    icon:'🎯' },
-    { key:'repaso',  label:'Repaso SM-2',desc:'Pendientes según el algoritmo',   icon:'🔁' },
+    { key:'study',   label:'Estudio',    desc:'Explicación tras cada respuesta', icon:'📖' },
+    { key:'errores', label:'Errores',    desc:'Preguntas que más has fallado',   icon:'🎯' },
+    { key:'repaso',  label:'Repaso SM-2',desc:'Pendientes según el algoritmo',  icon:'🔁' },
   ];
   const NUMS = [10,20,40,80];
 
@@ -222,8 +259,8 @@ function ExamScreen() {
   const mins = Math.floor(exam.timerSecs / 60);
   const secs = String(exam.timerSecs % 60).padStart(2, '0');
 
-  const [note, setNote]         = useState('');
-  const [noteOpen, setNoteOpen] = useState(false);
+  const [note, setNote]             = useState('');
+  const [noteOpen, setNoteOpen]     = useState(false);
   const [noteSaving, setNoteSaving] = useState(false);
 
   useEffect(() => {
@@ -367,7 +404,7 @@ function ExamScreen() {
   );
 }
 
-// ─── REVIEW SCREEN (modo exam — ver respuestas antes del resultado) ──
+// ─── REVIEW SCREEN ─────────────────────────────────────────
 function ReviewScreen() {
   const exam = useExamStore();
   return (
@@ -412,10 +449,9 @@ function ResultScreen() {
   const score = calcMirScore({ correct, wrong, blank });
   const mins  = Math.round(exam.timerSecs / 60);
 
-  // Por especialidad
   const espMap = {};
   exam.questions.forEach(q => {
-    const id  = q.specialty?.id;
+    const id   = q.specialty?.id;
     const name = q.specialty?.name || '—';
     if (!id) return;
     if (!espMap[id]) espMap[id] = { name, correct: 0, total: 0, color: q.specialty?.color };
@@ -430,7 +466,7 @@ function ResultScreen() {
     [90,'¡Sobresaliente! 🎉',`${pct}% de acierto. Rendimiento excepcional.`],
     [65,'¡Por encima del corte! ✓',`${pct}% — Buen ritmo para el MIR.`],
     [50,'Buen trabajo 💪',`${pct}% — Sigue practicando para superar el 65%.`],
-    [0,'A seguir mejorando 📚',`${pct}% — Revisa las explicaciones y repite.`],
+    [0, 'A seguir mejorando 📚',`${pct}% — Revisa las explicaciones y repite.`],
   ].find(([min]) => pct >= min);
 
   return (
@@ -444,10 +480,10 @@ function ResultScreen() {
         <p className="text-sm text-slate-400 mb-6 max-w-sm mx-auto">{sub}</p>
         <div className="grid grid-cols-4 gap-3 mb-6">
           {[
-            { label:'Correctas', val:correct, color:'text-pulse-dim' },
-            { label:'Incorrectas',val:wrong, color:'text-red-400' },
-            { label:'Blanco',    val:blank,   color:'text-slate-400' },
-            { label:'Tiempo',    val:`${mins}min`, color:'text-sky-600' },
+            { label:'Correctas',   val:correct,      color:'text-pulse-dim' },
+            { label:'Incorrectas', val:wrong,        color:'text-red-400' },
+            { label:'Blanco',      val:blank,        color:'text-slate-400' },
+            { label:'Tiempo',      val:`${mins}min`, color:'text-sky-600' },
           ].map(s => (
             <div key={s.label} className="bg-surface border border-border rounded-lg py-3 px-2 text-center">
               <div className={`font-display font-bold text-xl ${s.color}`}>{s.val}</div>
@@ -456,7 +492,7 @@ function ResultScreen() {
           ))}
         </div>
         <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-xs font-semibold border ${pct>=65?'bg-pulse-bg border-pulse-dim/30 text-pulse-dim':'bg-amber-50 border-amber-200 text-amber-600'}`}>
-          {pct>=65 ? `✓ Por encima del corte MIR estimado (65%)` : `Necesitas ${65-pct}pp más para el corte`}
+          {pct>=65 ? '✓ Por encima del corte MIR estimado (65%)' : `Necesitas ${65-pct}pp más para el corte`}
         </div>
       </div>
 
