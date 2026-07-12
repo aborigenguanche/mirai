@@ -213,6 +213,52 @@ function weekStart() {
 // exam_responses con una query normal.
 // Si necesitas analytics agregados en el futuro, crea la función SQL primero.
 
+// ─── Weak Specialties ──────────────────────────────────────
+// Calcula las especialidades con peor tasa de acierto del usuario
+// y actualiza profiles.weak_specialties.
+// Se llama al terminar cada sesión (ExamenPage y SimulacroPage).
+export async function updateWeakSpecialties(userId) {
+  // 1. Obtener todo el historial SM-2 con la especialidad de cada pregunta
+  const { data: states } = await supabase
+    .from('user_question_state')
+    .select('times_wrong, times_correct, question:questions(specialty_id)')
+    .eq('user_id', userId)
+    .gt('times_wrong', 0); // solo preguntas con al menos un error
+
+  if (!states?.length) return;
+
+  // 2. Agregar por especialidad
+  const specMap = {};
+  states.forEach(s => {
+    const specId = s.question?.specialty_id;
+    if (!specId) return;
+    if (!specMap[specId]) specMap[specId] = { wrong: 0, correct: 0 };
+    specMap[specId].wrong   += s.times_wrong   || 0;
+    specMap[specId].correct += s.times_correct || 0;
+  });
+
+  // 3. Calcular tasa de error y ordenar de peor a mejor
+  // Mínimo 3 intentos para que el dato sea fiable
+  const ranked = Object.entries(specMap)
+    .map(([id, { wrong, correct }]) => ({
+      id,
+      total:     wrong + correct,
+      errorRate: wrong / (wrong + correct),
+    }))
+    .filter(s => s.total >= 3)
+    .sort((a, b) => b.errorRate - a.errorRate)
+    .slice(0, 5)
+    .map(s => s.id);
+
+  if (!ranked.length) return;
+
+  // 4. Actualizar perfil
+  await supabase
+    .from('profiles')
+    .update({ weak_specialties: ranked })
+    .eq('id', userId);
+}
+
 export async function getSessionHistory(userId, limit = 50) {
   const { data } = await supabase.from('exam_sessions')
     .select('*').eq('user_id', userId)
