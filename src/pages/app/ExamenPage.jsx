@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
   supabase, fetchQuestions, fetchQuestionsByIds, createSession, finishSession,
-  saveResponses, getRepasoPendiente, getMostFailed, getNote, upsertNote
+  saveResponses, getRepasoPendiente, getMostFailed, getNote, upsertNote,
+  updateWeakSpecialties
   // upsertQuestionState eliminado — ahora se hace en batch directamente
 } from '../../lib/supabase';
 import { useAuthStore, useExamStore, toast } from '../../store';
@@ -10,7 +11,7 @@ import { classifyError, calcQuality, sm2, MIR_CONFIG, calcMirScore } from '../..
 import { Button, Badge, Spinner, ScoreRing, Card } from '../../components/ui';
 
 export default function ExamenPage() {
-  const { profile }    = useAuthStore();
+  const { profile, refreshProfile } = useAuthStore();
   const exam           = useExamStore();
   const [searchParams] = useSearchParams();
   const modoUrl        = searchParams.get('modo') || 'study';
@@ -110,6 +111,11 @@ export default function ExamenPage() {
         .upsert(sm2Rows, { onConflict: 'user_id,question_id' });
     }
     // ───────────────────────────────────────────────────────────────────
+
+    // Recalcular especialidades débiles y actualizar perfil
+    // Esto alimenta el Coach IA y el Plan de hoy con datos reales
+    await updateWeakSpecialties(profile.id);
+    if (typeof refreshProfile === 'function') await refreshProfile();
   }
 
   async function handleStart() {
