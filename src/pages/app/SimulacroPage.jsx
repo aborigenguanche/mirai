@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import {
   supabase, fetchQuestions, createSession, finishSession,
-  saveResponses, getHistoricalCutoffs, fetchSpecialties
+  saveResponses, getHistoricalCutoffs, fetchSpecialties,
+  updateWeakSpecialties
   // upsertQuestionState eliminado — ahora se hace en batch directamente
 } from '../../lib/supabase';
 import { useAuthStore, useExamStore, toast } from '../../store';
@@ -17,7 +18,7 @@ const SIMULACRO_QUESTIONS = 210;
 const SIMULACRO_MINS      = 235;
 
 export default function SimulacroPage() {
-  const { profile } = useAuthStore();
+  const { profile, refreshProfile } = useAuthStore();
   const exam        = useExamStore();
   const [phase, setPhase]           = useState('intro');
   const [cutoffs, setCutoffs]       = useState([]);
@@ -233,6 +234,10 @@ export default function SimulacroPage() {
         .upsert(sm2Rows, { onConflict: 'user_id,question_id' });
     }
     // ───────────────────────────────────────────────────────────────────
+
+    // Recalcular especialidades débiles y actualizar perfil
+    await updateWeakSpecialties(profile.id);
+    if (typeof refreshProfile === 'function') await refreshProfile();
 
     setResult({ correct, wrong, blank, score, percentile, order, extrap, analysis, bySpecialty,
       total: questions.length, secsUsed: SIMULACRO_MINS * 60 - secsLeft });
