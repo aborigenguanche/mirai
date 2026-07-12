@@ -82,20 +82,30 @@ export function AppLayout({ children }) {
               </span>
             )}
           </NavLink>
+
+          {/* Mi perfil */}
+          <NavLink to="/app/perfil" onClick={() => setOpen(false)}
+            className={({ isActive }) => `flex items-center gap-2.5 px-3 py-2.5 rounded-sm text-sm font-medium transition-all mb-1 ${isActive ? 'bg-pulse/12 text-pulse font-semibold' : 'text-white/55 hover:bg-white/6 hover:text-white/90'}`}>
+            ⚙️ Mi perfil
+          </NavLink>
+
           <button onClick={handleLogout}
             className="flex items-center gap-2.5 px-3 py-2.5 rounded-sm text-sm font-medium text-white/55 hover:bg-white/6 hover:text-white/90 transition-all w-full">
             → Cerrar sesión
           </button>
-          {/* Avatar */}
-          <div className="flex items-center gap-2.5 px-3 py-2.5 mt-1">
-            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-sky-400 to-pulse flex items-center justify-center font-display text-xs font-bold text-white shrink-0">
+
+          {/* Avatar — clickable al perfil */}
+          <NavLink to="/app/perfil" onClick={() => setOpen(false)}
+            className="flex items-center gap-2.5 px-3 py-2.5 mt-1 rounded-sm hover:bg-white/6 transition-all group">
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-sky-400 to-pulse flex items-center justify-center font-display text-xs font-bold text-white shrink-0 group-hover:ring-2 group-hover:ring-pulse/40 transition-all">
               {initials}
             </div>
             <div className="flex-1 min-w-0">
               <div className="text-xs font-semibold text-white truncate">{profile?.full_name || profile?.email}</div>
               <div className="font-mono text-[0.6rem] text-white/40 uppercase tracking-wider">{profile?.role}</div>
             </div>
-          </div>
+            <span className="text-white/20 group-hover:text-white/50 transition-colors text-xs shrink-0">→</span>
+          </NavLink>
         </div>
       </aside>
 
