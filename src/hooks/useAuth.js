@@ -3,22 +3,25 @@ import { supabase } from '../lib/supabase';
 import { useAuthStore } from '../store';
 
 export function useAuth() {
-  const { setUsuario, clearUsuario, setLoading } = useAuthStore();
+  // FIX: eliminado setLoading — no existe en el store actual.
+  // setProfile ya hace set({ profile, loading: false })
+  // clearProfile ya hace set({ profile: null, loading: false })
+  // El loading: true inicial del store cubre el estado de carga hasta
+  // que getSession resuelve y llama a uno de los dos.
+  const setProfile   = useAuthStore(s => s.setProfile);
+  const clearProfile = useAuthStore(s => s.clearProfile);
 
   useEffect(() => {
     let active = true;
 
-    const loadProfile = async (session) => {
+    async function loadProfile(session) {
       if (!active) return;
 
-      // No hay usuario → limpiar estado
       if (!session?.user) {
-        clearUsuario();
-        setLoading(false);
+        clearProfile();
         return;
       }
 
-      // 👇 LEER DIRECTAMENTE DE profiles (sin capas intermedias)
       const { data: profile, error } = await supabase
         .from('profiles')
         .select('*')
@@ -27,30 +30,17 @@ export function useAuth() {
 
       if (!active) return;
 
-      if (error || !profile) {
-        clearUsuario();
-      } else {
-        setUsuario(profile);
-      }
+      if (profile && !error) setProfile(profile);
+      else clearProfile();
+    }
 
-      setLoading(false);
-    };
+    // Carga inicial
+    supabase.auth.getSession().then(({ data }) => loadProfile(data.session));
 
-    const init = async () => {
-      setLoading(true);
-
-      const { data } = await supabase.auth.getSession();
-      await loadProfile(data.session);
-    };
-
-    init();
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setLoading(true);
-      loadProfile(session);
-    });
+    // Cambios de sesión (login, logout, token refresh)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => { loadProfile(session); }
+    );
 
     return () => {
       active = false;
@@ -58,5 +48,6 @@ export function useAuth() {
     };
   }, []);
 
-  return {};
+  const loading = useAuthStore(s => s.loading);
+  return { loading };
 }
