@@ -3,7 +3,11 @@ import { supabase } from '../lib/supabase';
 import { useAuthStore } from '../store';
 
 export function useAuth() {
-  const { setUsuario, clearUsuario, setLoading } = useAuthStore();
+  // FIX: el store antiguo usaba setUsuario/clearUsuario/setLoading.
+  // El store nuevo usa setProfile/clearProfile (loading está integrado).
+  // useAuth no se había actualizado → setUsuario era undefined →
+  // TypeError: a is not a function al iniciar la app → crash total.
+  const { setProfile, clearProfile, setLoading } = useAuthStore();
 
   useEffect(() => {
     let active = true;
@@ -11,14 +15,11 @@ export function useAuth() {
     const loadProfile = async (session) => {
       if (!active) return;
 
-      // No hay usuario → limpiar estado
       if (!session?.user) {
-        clearUsuario();
-        setLoading(false);
+        clearProfile();
         return;
       }
 
-      // 👇 LEER DIRECTAMENTE DE profiles (sin capas intermedias)
       const { data: profile, error } = await supabase
         .from('profiles')
         .select('*')
@@ -28,26 +29,21 @@ export function useAuth() {
       if (!active) return;
 
       if (error || !profile) {
-        clearUsuario();
+        clearProfile();
       } else {
-        setUsuario(profile);
+        setProfile(profile);
       }
-
-      setLoading(false);
     };
 
     const init = async () => {
       setLoading(true);
-
       const { data } = await supabase.auth.getSession();
       await loadProfile(data.session);
     };
 
     init();
 
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setLoading(true);
       loadProfile(session);
     });
@@ -58,5 +54,6 @@ export function useAuth() {
     };
   }, []);
 
-  return {};
+  const { loading } = useAuthStore();
+  return { loading };
 }

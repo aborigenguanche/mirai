@@ -7,6 +7,9 @@ export const useAuthStore = create((set) => ({
   loading:  true,
   setProfile:   (profile) => set({ profile, loading: false }),
   clearProfile: ()        => set({ profile: null, loading: false }),
+  // setLoading: necesario para que useAuth pueda indicar estado de carga
+  // antes de que el perfil esté disponible
+  setLoading:   (loading) => set({ loading }),
 
   // Recarga el perfil desde Supabase y actualiza el store
   // Úsalo después de cualquier update de perfil para que toda la app
