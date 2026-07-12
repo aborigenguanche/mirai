@@ -3,16 +3,18 @@ import { supabase } from '../lib/supabase';
 import { useAuthStore } from '../store';
 
 export function useAuth() {
-  // FIX: el store antiguo usaba setUsuario/clearUsuario/setLoading.
-  // El store nuevo usa setProfile/clearProfile (loading está integrado).
-  // useAuth no se había actualizado → setUsuario era undefined →
-  // TypeError: a is not a function al iniciar la app → crash total.
-  const { setProfile, clearProfile, setLoading } = useAuthStore();
+  // FIX: eliminado setLoading — no existe en el store actual.
+  // setProfile ya hace set({ profile, loading: false })
+  // clearProfile ya hace set({ profile: null, loading: false })
+  // El loading: true inicial del store cubre el estado de carga hasta
+  // que getSession resuelve y llama a uno de los dos.
+  const setProfile   = useAuthStore(s => s.setProfile);
+  const clearProfile = useAuthStore(s => s.clearProfile);
 
   useEffect(() => {
     let active = true;
 
-    const loadProfile = async (session) => {
+    async function loadProfile(session) {
       if (!active) return;
 
       if (!session?.user) {
@@ -28,25 +30,17 @@ export function useAuth() {
 
       if (!active) return;
 
-      if (error || !profile) {
-        clearProfile();
-      } else {
-        setProfile(profile);
-      }
-    };
+      if (profile && !error) setProfile(profile);
+      else clearProfile();
+    }
 
-    const init = async () => {
-      setLoading(true);
-      const { data } = await supabase.auth.getSession();
-      await loadProfile(data.session);
-    };
+    // Carga inicial
+    supabase.auth.getSession().then(({ data }) => loadProfile(data.session));
 
-    init();
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setLoading(true);
-      loadProfile(session);
-    });
+    // Cambios de sesión (login, logout, token refresh)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => { loadProfile(session); }
+    );
 
     return () => {
       active = false;
@@ -54,6 +48,6 @@ export function useAuth() {
     };
   }, []);
 
-  const { loading } = useAuthStore();
+  const loading = useAuthStore(s => s.loading);
   return { loading };
 }
