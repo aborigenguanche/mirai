@@ -3,18 +3,17 @@ import { supabase } from '../lib/supabase';
 import { useAuthStore } from '../store';
 
 export function useAuth() {
-  // FIX: eliminado setLoading — no existe en el store actual.
-  // setProfile ya hace set({ profile, loading: false })
-  // clearProfile ya hace set({ profile: null, loading: false })
-  // El loading: true inicial del store cubre el estado de carga hasta
-  // que getSession resuelve y llama a uno de los dos.
   const setProfile   = useAuthStore(s => s.setProfile);
   const clearProfile = useAuthStore(s => s.clearProfile);
 
   useEffect(() => {
     let active = true;
 
-    async function loadProfile(session) {
+    // FIX race condition en nuevos usuarios:
+    // Cuando Google OAuth crea un usuario por primera vez, onAuthStateChange
+    // puede disparar ANTES de que el trigger haya creado el perfil en profiles.
+    // Con reintentos esperamos hasta 3 segundos antes de rendirse.
+    async function loadProfile(session, retry = 0) {
       if (!active) return;
 
       if (!session?.user) {
@@ -30,22 +29,25 @@ export function useAuth() {
 
       if (!active) return;
 
-      if (profile && !error) setProfile(profile);
-      else clearProfile();
+      if (profile && !error) {
+        setProfile(profile);
+      } else if (retry < 5) {
+        // Reintenta cada 600ms — el trigger tarda < 1s normalmente
+        await new Promise(r => setTimeout(r, 600));
+        loadProfile(session, retry + 1);
+      } else {
+        // Después de 3s sin perfil → limpiar sesión
+        clearProfile();
+      }
     }
 
-    // Carga inicial
     supabase.auth.getSession().then(({ data }) => loadProfile(data.session));
 
-    // Cambios de sesión (login, logout, token refresh)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event, session) => { loadProfile(session); }
     );
 
-    return () => {
-      active = false;
-      subscription.unsubscribe();
-    };
+    return () => { active = false; subscription.unsubscribe(); };
   }, []);
 
   const loading = useAuthStore(s => s.loading);
