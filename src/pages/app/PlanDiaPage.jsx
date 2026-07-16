@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { supabase, countRepasoPendiente, getMostFailed, fetchSpecialties } from '../../lib/supabase';
+import { supabase, countRepasoPendiente, getMostFailed, fetchSpecialties, getAppConfig } from '../../lib/supabase';
 import { useAuthStore } from '../../store';
 import { Card, CardHeader, StatCard, LoadingScreen } from '../../components/ui';
 
@@ -68,9 +68,10 @@ export default function PlanDiaPage() {
       if (diasSet.has(d.toDateString())) r++; else if (i > 0) break;
     }
 
-    // Días al MIR desde el perfil
-    const mirDate = profile.fecha_mir ? new Date(profile.fecha_mir) : null;
-    const dMir    = mirDate ? Math.max(0, Math.ceil((mirDate - new Date()) / 86400000)) : null;
+    // Fecha MIR global — gestionada por el admin, igual para todos los usuarios
+    const fechaMirGlobal = await getAppConfig('fecha_mir');
+    const mirDate        = fechaMirGlobal ? new Date(fechaMirGlobal) : null;
+    const dMir           = mirDate ? Math.max(0, Math.ceil((mirDate - new Date()) / 86400000)) : null;
 
     // Especialidades débiles: guardamos { id, name } para usar id en URLs
     const specs      = profile.weak_specialties || [];
