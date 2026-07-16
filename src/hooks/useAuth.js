@@ -17,11 +17,6 @@ export function useAuth() {
         return;
       }
 
-      // FIX: maybeSingle() en lugar de single()
-      // .single() devuelve HTTP 406 cuando hay 0 filas → el error se trata
-      // como "no hay perfil" y redirige al login inmediatamente.
-      // .maybeSingle() devuelve { data: null, error: null } cuando hay 0 filas
-      // → el retry funciona correctamente esperando a que el trigger cree el perfil.
       const { data: profile } = await supabase
         .from('profiles')
         .select('*')
