@@ -213,6 +213,23 @@ function weekStart() {
 // exam_responses con una query normal.
 // Si necesitas analytics agregados en el futuro, crea la función SQL primero.
 
+// ─── App Config ────────────────────────────────────────────
+// Configuración global de la app — gestionada desde el panel admin
+// Cacheo en memoria para evitar múltiples requests por la misma clave
+const _configCache = {};
+
+export async function getAppConfig(key) {
+  if (_configCache[key] !== undefined) return _configCache[key];
+  const { data } = await supabase
+    .from('app_config').select('value').eq('key', key).single();
+  _configCache[key] = data?.value || null;
+  return _configCache[key];
+}
+
+export function invalidateAppConfig(key) {
+  delete _configCache[key];
+}
+
 // ─── Weak Specialties ──────────────────────────────────────
 // Calcula las especialidades con peor tasa de acierto del usuario
 // y actualiza profiles.weak_specialties.
