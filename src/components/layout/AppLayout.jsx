@@ -20,6 +20,7 @@ const NAV_ADMIN = [
   { to:'/admin/usuarios',     label:'Usuarios',        icon:'👥' },
   { to:'/admin/notificaciones', label:'Notificaciones',icon:'🔔' },
   { to:'/admin/analytics',    label:'Analytics',       icon:'📈' },
+  { to:'/admin/config',       label:'Configuración',   icon:'⚙️' },
 ];
 
 export function AppLayout({ children }) {
