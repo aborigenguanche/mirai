@@ -9,10 +9,6 @@ export function useAuth() {
   useEffect(() => {
     let active = true;
 
-    // FIX race condition en nuevos usuarios:
-    // Cuando Google OAuth crea un usuario por primera vez, onAuthStateChange
-    // puede disparar ANTES de que el trigger haya creado el perfil en profiles.
-    // Con reintentos esperamos hasta 3 segundos antes de rendirse.
     async function loadProfile(session, retry = 0) {
       if (!active) return;
 
@@ -21,22 +17,27 @@ export function useAuth() {
         return;
       }
 
-      const { data: profile, error } = await supabase
+      // FIX: maybeSingle() en lugar de single()
+      // .single() devuelve HTTP 406 cuando hay 0 filas → el error se trata
+      // como "no hay perfil" y redirige al login inmediatamente.
+      // .maybeSingle() devuelve { data: null, error: null } cuando hay 0 filas
+      // → el retry funciona correctamente esperando a que el trigger cree el perfil.
+      const { data: profile } = await supabase
         .from('profiles')
         .select('*')
         .eq('id', session.user.id)
-        .single();
+        .maybeSingle();
 
       if (!active) return;
 
-      if (profile && !error) {
+      if (profile) {
         setProfile(profile);
       } else if (retry < 5) {
-        // Reintenta cada 600ms — el trigger tarda < 1s normalmente
-        await new Promise(r => setTimeout(r, 600));
-        loadProfile(session, retry + 1);
+        // Reintenta cada 800ms — el trigger de creación de perfil
+        // puede tardar hasta ~1s en nuevos usuarios de Google OAuth
+        await new Promise(r => setTimeout(r, 800));
+        await loadProfile(session, retry + 1);
       } else {
-        // Después de 3s sin perfil → limpiar sesión
         clearProfile();
       }
     }
