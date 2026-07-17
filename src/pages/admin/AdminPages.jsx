@@ -143,21 +143,12 @@ export function UsuariosPage() {
 
   async function handleDelete() {
     setDeleting(true);
-
-    // FIX: Añadido manejo de error
-    const { error } = await supabase.from('profiles').delete().eq('id', deleteP.id);
-
-    if (error) {
-      toast.error('Error al eliminar: ' + error.message);
-      setDeleting(false);
-      return;
-    }
-
+    const { error } = await supabase.rpc('admin_delete_user', { 
+      target_user_id: deleteP.id 
+    });
+    if (error) { toast.error('Error: ' + error.message); setDeleting(false); return; }
     toast.success('Usuario eliminado');
-    setDeleting(false);
-    setDeleteP(null);
-    setSelected(null);
-    load();
+    setDeleting(false); setDeleteP(null); setSelected(null); load();
   }
 
   async function handleCreate() {
