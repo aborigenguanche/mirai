@@ -24,23 +24,17 @@ export function useAuth() {
       if (!active) return;
 
       if (profile) {
-        // Perfil encontrado — flujo normal
         setProfile(profile);
       } else if (retry < 3) {
-        // Espera al trigger de Supabase (puede tardar ~500ms)
         await new Promise(r => setTimeout(r, 800));
         await loadProfile(session, retry + 1);
       } else {
-        // El trigger no creó el perfil — lo creamos nosotros directamente
-        // Esto cubre casos donde el trigger falla silenciosamente
-        const { data: newProfile, error } = await supabase
+        const { data: newProfile } = await supabase
           .from('profiles')
           .upsert({
             id:                   user.id,
             email:                user.email,
-            full_name:            user.user_metadata?.full_name
-                               || user.user_metadata?.name
-                               || null,
+            full_name:            user.user_metadata?.full_name || user.user_metadata?.name || null,
             role:                 'user',
             subscription_status:  'trial',
             onboarding_completed: false,
