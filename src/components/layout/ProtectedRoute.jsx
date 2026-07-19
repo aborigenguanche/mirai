@@ -9,7 +9,6 @@ export function ProtectedRoute({ children, adminOnly = false }) {
   if (!profile) return <Navigate to="/auth/login" replace />;
   if (adminOnly && !isAdmin(profile)) return <Navigate to="/app/plan" replace />;
   if (!hasAccess(profile)) return <Navigate to="/auth/checkout" replace />;
-  // Onboarding activado — nuevos usuarios pasan por la pantalla de bienvenida
   if (needsOnboarding(profile)) return <Navigate to="/auth/onboarding" replace />;
   return children;
 }
