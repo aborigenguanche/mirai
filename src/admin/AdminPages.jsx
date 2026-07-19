@@ -144,18 +144,14 @@ export function UsuariosPage() {
   async function handleDelete() {
     setDeleting(true);
 
-    // BUG 7 FIX: antes solo borraba de `profiles`, dejando al usuario
-    // activo en auth.users — podía seguir iniciando sesión.
-    // Ahora llama a la Edge Function delete-user que usa service_role
-    // para eliminar también de auth.users y todos los datos relacionados.
-    const { data: { session } } = await supabase.auth.getSession();
-    const { data, error } = await supabase.functions.invoke('delete-user', {
-      body: { userId: deleteP.id },
-      headers: { Authorization: `Bearer ${session?.access_token}` },
+    // Llama a la función SQL admin_delete_user que borra todo
+    // incluyendo auth.users — sin necesidad de Edge Function
+    const { error } = await supabase.rpc('admin_delete_user', {
+      target_user_id: deleteP.id,
     });
 
-    if (error || data?.error) {
-      toast.error('Error al eliminar: ' + (data?.error || error.message));
+    if (error) {
+      toast.error('Error al eliminar: ' + error.message);
       setDeleting(false);
       return;
     }
