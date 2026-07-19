@@ -9,13 +9,14 @@ export function useAuth() {
   useEffect(() => {
     let active = true;
 
-    async function loadProfile(session, retry = 0) {
+    async function loadProfile(session) {
       if (!active) return;
       if (!session?.user) { clearProfile(); return; }
 
       const user = session.user;
 
-      const { data: profile } = await supabase
+      // 1. Buscar perfil existente
+      const { data: existing } = await supabase
         .from('profiles')
         .select('*')
         .eq('id', user.id)
@@ -23,29 +24,33 @@ export function useAuth() {
 
       if (!active) return;
 
-      if (profile) {
-        setProfile(profile);
-      } else if (retry < 3) {
-        await new Promise(r => setTimeout(r, 800));
-        await loadProfile(session, retry + 1);
-      } else {
-        const { data: newProfile } = await supabase
-          .from('profiles')
-          .upsert({
-            id:                   user.id,
-            email:                user.email,
-            full_name:            user.user_metadata?.full_name || user.user_metadata?.name || null,
-            role:                 'user',
-            subscription_status:  'trial',
-            onboarding_completed: false,
-          }, { onConflict: 'id' })
-          .select()
-          .single();
-
-        if (!active) return;
-        if (newProfile) setProfile(newProfile);
-        else clearProfile();
+      if (existing) {
+        // Perfil encontrado — flujo normal
+        setProfile(existing);
+        return;
       }
+
+      // 2. No existe — crearlo directamente
+      // Cubre: nuevos usuarios, usuarios con perfil borrado por admin
+      const { data: created, error } = await supabase
+        .from('profiles')
+        .insert({
+          id:                   user.id,
+          email:                user.email,
+          full_name:            user.user_metadata?.full_name
+                             || user.user_metadata?.name
+                             || null,
+          role:                 'user',
+          subscription_status:  'trial',
+          onboarding_completed: false,
+        })
+        .select()
+        .single();
+
+      if (!active) return;
+
+      if (created) setProfile(created);
+      else { console.error('Error creando perfil:', error); clearProfile(); }
     }
 
     supabase.auth.getSession().then(({ data }) => loadProfile(data.session));
