@@ -1,44 +1,50 @@
 import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  supabase, fetchQuestions, createSession, finishSession,
-  saveResponses, getHistoricalCutoffs, fetchSpecialties,
-  updateWeakSpecialties
-  // upsertQuestionState eliminado — ahora se hace en batch directamente
+  fetchSimulacroQuestions, startSession, submitSession,
+  getHistoricalCutoffs, fetchSpecialties, reportError,
 } from '../../lib/supabase';
-import { useAuthStore, useExamStore, toast } from '../../store';
-import {
-  MIR_CONFIG, calcMirScore, extrapolateScore, calcPercentile,
-  estimateOrder, analyzeSpecialties, analyzeBySpecialty, classifyError,
-  calcQuality, sm2
-} from '../../lib/mir-scoring';
+import { useAuthStore, toast } from '../../store';
+import { MIR_CONFIG, calcPercentile, estimateOrder, analyzeSpecialties, analyzeBySpecialty } from '../../lib/mir-scoring';
 import { Button, Badge, ScoreRing, Card, CardHeader, Spinner } from '../../components/ui';
 
 const SIMULACRO_QUESTIONS = 210;
 const SIMULACRO_MINS      = 235;
+// Tiempo proporcional al nº de preguntas (50 → ~56 min, 210 → 3h55)
+const minsFor = n => Math.max(1, Math.round(SIMULACRO_MINS * n / SIMULACRO_QUESTIONS));
+const fmtMins = m => m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}` : `${m} min`;
 
 export default function SimulacroPage() {
   const { profile, refreshProfile } = useAuthStore();
-  const exam        = useExamStore();
-  const [phase, setPhase]           = useState('intro');
-  const [cutoffs, setCutoffs]       = useState([]);
+  const storageKey = `mirai:sim:${profile?.id}`;
+
+  const [phase, setPhase]             = useState('intro');   // intro | config | exam | result
+  const [cutoffs, setCutoffs]         = useState([]);
   const [specialties, setSpecialties] = useState([]);
-  const [config, setConfig]         = useState({ year: SIMULACRO_QUESTIONS, numQuestions: SIMULACRO_QUESTIONS });
-  const [loading, setLoading]       = useState(false);
-  const [responses, setResponses]   = useState({});
-  const [questions, setQuestions]   = useState([]);
-  const [current, setCurrent]       = useState(0);
-  const [selected, setSelected]     = useState(null);
-  const [flagged, setFlagged]       = useState(new Set());
-  const [sessionId, setSessionId]   = useState(null);
-  const [secsLeft, setSecsLeft]     = useState(SIMULACRO_MINS * 60);
-  const [result, setResult]         = useState(null);
-  const timerRef    = useRef(null);
-  const qStart      = useRef(null);
-  // BUG 3 FIX: guard para evitar que handleFinish se ejecute dos veces.
-  // Sin esto, el timer y el botón Entregar podían dispararlo simultáneamente,
-  // duplicando exam_responses y el SM-2 update.
-  const finishingRef = useRef(false);
+  const [config, setConfig]           = useState({ numQuestions: SIMULACRO_QUESTIONS });
+  const [loading, setLoading]         = useState(false);
+  const [responses, setResponses]     = useState({});        // { questionId: letra }  (sin entrada = en blanco)
+  const [questions, setQuestions]     = useState([]);
+  const [current, setCurrent]         = useState(0);
+  const [flagged, setFlagged]         = useState(new Set());
+  const [sessionId, setSessionId]     = useState(null);
+  const [secsLeft, setSecsLeft]       = useState(0);
+  const [result, setResult]           = useState(null);
+  const [submitError, setSubmitError] = useState(null);
+  const [mapOpen, setMapOpen]         = useState(false);
+
+  const endAtRef     = useRef(0);          // instante (ms) en que se acaba el tiempo
+  const qStart       = useRef(Date.now());
+  const timesRef     = useRef({});         // { questionId: segundos acumulados }
+  const finishingRef = useRef(false);      // evita doble entrega
+  const retryAtRef   = useRef(0);          // espera entre reintentos si falla la red
+
+  // `live` siempre refleja el estado ACTUAL. handleFinish lo lee desde aquí, de modo que
+  // la entrega automática al agotarse el tiempo (dentro de un setInterval) nunca usa un
+  // estado obsoleto — antes enviaba todas las respuestas en blanco.
+  const live = useRef({});
+  live.current = { questions, responses, current, sessionId, cutoffs, specialties, secsLeft };
+  const finishRef = useRef(null);
 
   useEffect(() => {
     Promise.all([
@@ -47,208 +53,160 @@ export default function SimulacroPage() {
     ]);
   }, []);
 
-  // Timer regresivo
+  // Recuperar un simulacro en curso tras recargar la página
   useEffect(() => {
-    if (phase !== 'exam') { clearInterval(timerRef.current); return; }
-    timerRef.current = setInterval(() => {
-      setSecsLeft(s => {
-        // Nota: el timer no puede pasar `selected` porque es un closure sobre
-        // el state en el momento de crear el interval. Se pasa null y handleFinish
-        // usará lo que ya esté en responses (la pregunta actual si fue confirmada).
-        if (s <= 1) { clearInterval(timerRef.current); handleFinish(null); return 0; }
-        return s - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timerRef.current);
+    if (!profile) return;
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (!raw) return;
+      const sv = JSON.parse(raw);
+      if (!sv.sessionId || !sv.questions?.length) return;
+      timesRef.current = sv.times || {};
+      endAtRef.current = sv.endAt;
+      setQuestions(sv.questions);
+      setResponses(sv.responses || {});
+      setFlagged(new Set(sv.flagged || []));
+      setCurrent(Math.min(sv.current || 0, sv.questions.length - 1));
+      setSessionId(sv.sessionId);
+      setSecsLeft(Math.max(0, Math.round((sv.endAt - Date.now()) / 1000)));
+      qStart.current = Date.now();
+      setPhase('exam');
+      toast.info('Hemos recuperado tu simulacro en curso');
+    } catch { try { localStorage.removeItem(storageKey); } catch { /* sin storage */ } }
+  }, [profile?.id]);
+
+  // Guardar el progreso en cada cambio (sobrevive a F5 / cierre accidental)
+  useEffect(() => {
+    if (phase !== 'exam' || !sessionId) return;
+    try {
+      localStorage.setItem(storageKey, JSON.stringify({
+        sessionId, questions, responses, flagged: [...flagged], current,
+        endAt: endAtRef.current, times: timesRef.current,
+      }));
+    } catch { /* sin storage */ }
+  }, [phase, sessionId, questions, responses, flagged, current]);
+
+  // Cuenta atrás con reloj real (no se frena en pestañas en segundo plano)
+  useEffect(() => {
+    if (phase !== 'exam') return;
+    const tick = () => {
+      const left = Math.max(0, Math.round((endAtRef.current - Date.now()) / 1000));
+      setSecsLeft(left);
+      if (left <= 0) finishRef.current?.();
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [phase]);
+
+  // Atajos: A–E responden, ← → navegan
+  useEffect(() => {
+    if (phase !== 'exam') return;
+    function onKey(e) {
+      const tag = (e.target?.tagName || '').toLowerCase();
+      if (tag === 'textarea' || tag === 'input' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      const cq = live.current.questions[live.current.current];
+      if (['a', 'b', 'c', 'd', 'e'].includes(k) && cq?.options.some(o => o.letter === k)) handleAnswer(k);
+      else if (k === 'arrowright') handleNext();
+      else if (k === 'arrowleft')  handlePrev();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, [phase]);
 
   async function handleStart() {
     setLoading(true);
-    // BUG 8 FIX: el for-loop con await cargaba especialidades secuencialmente.
-    // Con 30+ especialidades = 30 requests en serie → simulacro tardaba mucho.
-    // Promise.all las lanza todas en paralelo → mismos datos, mucho más rápido.
-    const results = await Promise.all(
-      specialties.map(sp => {
-        const weight = MIR_CONFIG.distributionBySpecialty[sp.id] || 5;
-        return fetchQuestions({ specialtyId: sp.id, limit: weight });
-      })
-    );
-    let all = results.flat();
-    if (all.length < config.numQuestions) {
-      const extra = await fetchQuestions({ limit: config.numQuestions - all.length, excludeIds: all.map(q => q.id) });
-      all = [...all, ...extra];
-    }
-    const shuffled = all.sort(() => Math.random() - 0.5).slice(0, config.numQuestions);
-
-    const session = await createSession({
-      userId: profile.id, mode: 'simulacro',
-      specialtyFilter: [], totalQuestions: shuffled.length,
-      timeLimitMinutes: SIMULACRO_MINS,
-    });
-
-    setQuestions(shuffled);
-    setSessionId(session.id);
-    setSecsLeft(SIMULACRO_MINS * 60);
-    setResponses({});
-    setCurrent(0);
-    setSelected(null);
-    setFlagged(new Set());
-    qStart.current    = Date.now();
-    finishingRef.current = false; // reset guard para este simulacro
-    setLoading(false);
-    setPhase('exam');
+    try {
+      // El servidor reparte las preguntas según el peso real de cada especialidad
+      const qs = await fetchSimulacroQuestions(config.numQuestions);
+      if (!qs.length) { toast.error('Todavía no hay preguntas suficientes para un simulacro.'); return; }
+      const minutes = minsFor(qs.length);
+      const session = await startSession({ mode: 'simulacro', total: qs.length, timeLimitMinutes: minutes });
+      timesRef.current   = {};
+      endAtRef.current   = Date.now() + minutes * 60000;
+      qStart.current     = Date.now();
+      finishingRef.current = false;
+      retryAtRef.current   = 0;
+      setQuestions(qs); setSessionId(session.id); setResponses({}); setCurrent(0);
+      setFlagged(new Set()); setSubmitError(null); setResult(null);
+      setSecsLeft(minutes * 60);
+      setPhase('exam');
+    } catch (e) {
+      toast.error(e.code === '42501' ? 'Tu acceso ha caducado.' : 'No se pudo iniciar el simulacro: ' + e.message);
+      reportError(e);
+    } finally { setLoading(false); }
   }
 
+  // Cada respuesta se guarda al instante en el estado (y de ahí en localStorage)
   function handleAnswer(letter) {
-    if (responses[questions[current]?.id]?.confirmed) return;
-    setSelected(letter);
+    const cq = live.current.questions[live.current.current];
+    if (!cq) return;
+    setResponses(prev => {
+      const n = { ...prev };
+      if (letter === null) delete n[cq.id]; else n[cq.id] = letter;
+      return n;
+    });
   }
+  const setSelected = handleAnswer;   // el botón "Dejar en blanco" usa setSelected(null)
 
-  function handleNext() {
-    const q = questions[current];
-    if (q) {
-      const timeSecs = Math.round((Date.now() - qStart.current) / 1000);
-      setResponses(prev => ({ ...prev, [q.id]: { letter: selected, timeSecs, confirmed: true } }));
-    }
-    setSelected(null);
-    qStart.current = Date.now();
-    if (current < questions.length - 1) setCurrent(c => c + 1);
-  }
-
-  function handlePrev() {
-    if (current > 0) { setCurrent(c => c - 1); setSelected(responses[questions[current-1]?.id]?.letter || null); }
-  }
-
-  function goTo(idx) {
-    const q = questions[current];
-    if (q && selected !== null) {
-      setResponses(prev => ({
-        ...prev,
-        [q.id]: { ...(prev[q.id]||{}), letter: selected, timeSecs: Math.round((Date.now()-qStart.current)/1000) },
-      }));
-    }
-    setCurrent(idx);
-    setSelected(responses[questions[idx]?.id]?.letter || null);
+  function commitTime() {
+    const cq = live.current.questions[live.current.current];
+    if (!cq) return;
+    timesRef.current[cq.id] = (timesRef.current[cq.id] || 0) + Math.round((Date.now() - qStart.current) / 1000);
     qStart.current = Date.now();
   }
-
+  function handleNext() { commitTime(); setCurrent(c => Math.min(c + 1, live.current.questions.length - 1)); }
+  function handlePrev() { commitTime(); setCurrent(c => Math.max(c - 1, 0)); }
+  function goTo(idx)    { commitTime(); setCurrent(idx); }
   function toggleFlag() {
-    const id = questions[current]?.id;
+    const id = live.current.questions[live.current.current]?.id;
     if (!id) return;
     setFlagged(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   }
 
-  // BUG 2 FIX: acepta seleccionActual como parámetro para capturar la respuesta
-  // de la pregunta actual ANTES de que React actualice el estado con setResponses.
-  // Sin esto, cuando el usuario pulsa "Entregar examen" en la última pregunta,
-  // handleNext llama setResponses (async) y handleFinish lee responses antes
-  // de que se aplique la actualización — la última respuesta siempre se perdía.
-  // BUG 3 FIX: guard finishingRef evita doble ejecución (timer + botón).
-  async function handleFinish(seleccionActual = null) {
-    if (finishingRef.current) return;
+  // Entrega: el servidor corrige TODO y devuelve las soluciones solo ahora
+  async function handleFinish() {
+    if (finishingRef.current || Date.now() < retryAtRef.current) return;
     finishingRef.current = true;
-    clearInterval(timerRef.current);
-    setLoading(true);
-
-    // Construir copia local de responses incluyendo la pregunta actual
-    // (que puede no estar en el state si setResponses aún no se ha aplicado)
-    const responsesFinales = { ...responses };
-    const preguntaActual   = questions[current];
-    if (preguntaActual && seleccionActual !== undefined) {
-      responsesFinales[preguntaActual.id] = {
-        ...(responsesFinales[preguntaActual.id] || {}),
-        letter:    seleccionActual,
-        timeSecs:  Math.round((Date.now() - qStart.current) / 1000),
-        confirmed: true,
-      };
-    }
-
-    // Calcular resultados
-    let correct = 0, wrong = 0, blank = 0;
-    const responseRows = [];
-
-    questions.forEach(q => {
-      const r         = responsesFinales[q.id]; // ← usa la copia local, no el state
-      const letter    = r?.letter || null;
-      const isCorrect = letter === q.correct_option_letter;
-      if (!letter) blank++;
-      else if (isCorrect) correct++;
-      else wrong++;
-
-      responseRows.push({
-        session_id: sessionId, question_id: q.id, user_id: profile.id,
-        selected_option_letter: letter, is_correct: isCorrect,
-        time_taken_seconds: r?.timeSecs || null,
+    commitTime();
+    const st = live.current;
+    setLoading(true); setSubmitError(null);
+    const answers = st.questions.map(q => ({
+      question_id: q.id, letter: st.responses[q.id] ?? null, time_secs: timesRef.current[q.id] || 0,
+    }));
+    try {
+      const sub = await submitSession(st.sessionId, answers);
+      try { localStorage.removeItem(storageKey); } catch { /* sin storage */ }
+      const byId = Object.fromEntries((sub.results || []).map(r => [r.question_id, r]));
+      const rows = st.questions.map(q => ({
+        question: q, selected_option_letter: byId[q.id]?.selected ?? null, is_correct: !!byId[q.id]?.is_correct,
+      }));
+      const score = sub.score;
+      setResult({
+        correct: sub.correct, wrong: sub.wrong, blank: sub.blank, score,
+        percentile: calcPercentile(score), order: estimateOrder(score),
+        analysis: analyzeSpecialties(score, st.cutoffs),
+        bySpecialty: analyzeBySpecialty(rows, st.specialties),
+        total: st.questions.length,
+        secsUsed: Math.max(0, minsFor(st.questions.length) * 60 - st.secsLeft),
       });
-    });
-
-    const score      = calcMirScore({ correct, wrong, blank });
-    const extrap     = extrapolateScore({ correct, wrong, blank, totalAnswered: questions.length });
-    const percentile = calcPercentile(score);
-    const order      = estimateOrder(score);
-    const analysis   = analyzeSpecialties(score, cutoffs);
-    const bySpecialty = analyzeBySpecialty(responseRows.map((r,i) => ({
-      ...r, question: questions[i], is_correct: r.is_correct,
-    })), specialties);
-
-    // Guardar sesión y respuestas en paralelo
-    await Promise.all([
-      finishSession({ sessionId, numCorrect: correct, numWrong: wrong, numBlank: blank, score }),
-      saveResponses(responseRows),
-    ]);
-
-    // ─── FIX SM-2: Batch en 2 requests en lugar de N*2 ────────────────
-    // Antes: forEach(async...) → N selects + N upserts en paralelo sin control
-    //        → podía fallar silenciosamente y no se esperaba antes del resultado
-    // Ahora: 1 SELECT de todas + 1 UPSERT de todas, correctamente esperado
-    const { data: existingStates } = await supabase
-      .from('user_question_state')
-      .select('*')
-      .eq('user_id', profile.id)
-      .in('question_id', questions.map(q => q.id));
-
-    const stateMap = Object.fromEntries(
-      (existingStates || []).map(s => [s.question_id, s])
-    );
-
-    const sm2Rows = questions.map((q, i) => {
-      const r        = responseRows[i];
-      const existing = stateMap[q.id] || {};
-      const quality  = calcQuality(r.is_correct, r.time_taken_seconds || 30);
-      const newState = sm2(existing, quality);
-      const errType  = classifyError(r.is_correct, q.correct_option_letter, r.selected_option_letter, r.time_taken_seconds);
-      return {
-        user_id:         profile.id,
-        question_id:     q.id,
-        ...newState,
-        last_error_type: errType || existing.last_error_type || null,
-        times_wrong:     (existing.times_wrong  || 0) + (r.is_correct ? 0 : 1),
-        times_correct:   (existing.times_correct || 0) + (r.is_correct ? 1 : 0),
-        updated_at:      new Date().toISOString(),
-      };
-    });
-
-    if (sm2Rows.length > 0) {
-      await supabase
-        .from('user_question_state')
-        .upsert(sm2Rows, { onConflict: 'user_id,question_id' });
-    }
-    // ───────────────────────────────────────────────────────────────────
-
-    // Recalcular especialidades débiles y actualizar perfil
-    await updateWeakSpecialties(profile.id);
-    if (typeof refreshProfile === 'function') await refreshProfile();
-
-    setResult({ correct, wrong, blank, score, percentile, order, extrap, analysis, bySpecialty,
-      total: questions.length, secsUsed: SIMULACRO_MINS * 60 - secsLeft });
-    setLoading(false);
-    setPhase('result');
+      await refreshProfile?.();      // especialidades débiles recalculadas en el servidor
+      setPhase('result');
+    } catch (e) {
+      finishingRef.current = false;
+      retryAtRef.current = Date.now() + 5000;
+      setSubmitError(e.message || 'Error de red');
+      reportError(e);
+    } finally { setLoading(false); }
   }
+  finishRef.current = handleFinish;
 
-  const mins    = Math.floor(secsLeft / 60);
-  const secs    = String(secsLeft % 60).padStart(2, '0');
-  const answered = Object.values(responses).filter(r => r.letter).length;
-  const q       = questions[current];
+  const mins     = Math.floor(secsLeft / 60);
+  const secs     = String(secsLeft % 60).padStart(2, '0');
+  const answered = Object.keys(responses).length;
+  const q        = questions[current];
+  const selected = q ? (responses[q.id] ?? null) : null;
 
   // ─── INTRO ─────────────────────────────────────────────
   if (phase === 'intro') return (
@@ -310,7 +268,7 @@ export default function SimulacroPage() {
         <div className="mb-5">
           <label className="block text-sm font-semibold text-ink mb-2">Número de preguntas</label>
           <div className="grid grid-cols-3 gap-3">
-            {[[50,'Parcial ~25min'],[100,'Medio ~50min'],[210,'Completo 3h55min']].map(([n,l]) => (
+            {[[50,'Parcial ~'+fmtMins(minsFor(50))],[100,'Medio ~'+fmtMins(minsFor(100))],[210,'Completo '+fmtMins(minsFor(210))]].map(([n,l]) => (
               <button key={n} onClick={() => setConfig(c=>({...c,numQuestions:n}))}
                 className={`p-3 rounded-lg border-2 text-center transition-all ${config.numQuestions===n?'border-ink bg-ink text-white':'border-border hover:border-sky-300 hover:bg-sky-50 text-ink'}`}>
                 <div className="font-display font-bold text-xl">{n}</div>
@@ -332,13 +290,41 @@ export default function SimulacroPage() {
 
   // ─── EXAM ──────────────────────────────────────────────
   if (phase === 'exam' && q) {
-    const resp      = responses[q.id];
     const isFlagged = flagged.has(q.id);
     const pctDone   = Math.round((answered / questions.length) * 100);
     const isUrgent  = secsLeft < 10 * 60;
 
     return (
       <div className="flex flex-col h-screen overflow-hidden">
+        {loading && (
+          <div className="fixed inset-0 z-[300] bg-ink/70 flex items-center justify-center">
+            <div className="bg-white rounded-xl px-6 py-5 text-center"><Spinner size="lg"/><div className="mt-3 text-sm font-semibold text-ink">Entregando y corrigiendo…</div></div>
+          </div>
+        )}
+        {submitError && !loading && (
+          <div className="fixed top-16 left-1/2 -translate-x-1/2 z-[300] bg-amber-50 border border-amber-300 rounded-lg px-4 py-3 text-sm text-amber-800 flex items-center gap-3 shadow-lg">
+            <span>No se pudo entregar. Tus respuestas están a salvo.</span>
+            <button onClick={() => { retryAtRef.current = 0; handleFinish(); }} className="font-semibold underline">Reintentar</button>
+          </div>
+        )}
+        {mapOpen && (
+          <div className="lg:hidden fixed inset-0 z-[250] bg-ink/50" onClick={() => setMapOpen(false)}>
+            <div className="absolute bottom-0 inset-x-0 bg-white rounded-t-2xl p-4 max-h-[70vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+              <div className="text-xs font-mono font-semibold uppercase tracking-wider text-slate-400 mb-3">Navegador · {answered}/{questions.length} respondidas</div>
+              <div className="grid grid-cols-7 gap-1.5">
+                {questions.map((qq, i) => {
+                  const r = responses[qq.id];
+                  return (
+                    <button key={qq.id} onClick={() => { goTo(i); setMapOpen(false); }}
+                      className={`h-9 rounded-md text-xs font-mono font-bold border ${i===current?'border-ink bg-ink text-white':flagged.has(qq.id)?'border-amber-400 bg-amber-50 text-amber-700':r?'border-pulse-dim/40 bg-pulse-bg text-pulse-dim':'border-border bg-white text-slate-400'}`}>
+                      {i + 1}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
         {/* Topbar fijo */}
         <div className={`border-b px-5 py-3 flex items-center gap-4 shrink-0 ${isUrgent?'bg-red-50 border-red-200':'bg-white border-border'}`}>
           <div className="flex items-center gap-2 shrink-0">
@@ -356,7 +342,8 @@ export default function SimulacroPage() {
           <div className={`flex items-center gap-2 px-4 py-2 rounded-full font-mono text-sm font-bold shrink-0 ${isUrgent?'bg-red-500 text-white animate-pulse':'bg-ink text-pulse'}`}>
             ⏱ {mins}:{secs}
           </div>
-          <button onClick={() => { if (confirm('¿Entregar el simulacro ahora?')) handleFinish(selected); }}
+          <button onClick={() => setMapOpen(true)} className="lg:hidden px-3 py-1.5 border border-border text-xs font-semibold rounded-full shrink-0">Mapa</button>
+          <button onClick={() => { if (confirm('¿Entregar el simulacro ahora?')) handleFinish(); }}
             className="px-3 py-1.5 bg-ink text-white text-xs font-bold rounded-full hover:opacity-90 transition-opacity shrink-0">
             Entregar
           </button>
@@ -383,7 +370,7 @@ export default function SimulacroPage() {
                     className={`w-8 h-8 rounded-md text-xs font-mono font-bold transition-all border
                       ${isCurr ? 'border-ink bg-ink text-white' :
                         isFlag  ? 'border-amber-400 bg-amber-50 text-amber-700' :
-                        r?.letter ? 'border-pulse-dim/40 bg-pulse-bg text-pulse-dim' :
+                        r ? 'border-pulse-dim/40 bg-pulse-bg text-pulse-dim' :
                         'border-border bg-white text-slate-400 hover:border-sky-300'}`}>
                     {i + 1}
                   </button>
@@ -419,12 +406,13 @@ export default function SimulacroPage() {
 
               <div className="bg-white border border-border rounded-xl p-6 mb-5 shadow-sm">
                 <p className="font-display text-base font-semibold text-ink leading-relaxed">{q.text}</p>
+                {q.image_url && <img src={q.image_url} alt="Imagen de la pregunta" loading="lazy" className="mt-4 max-h-96 w-auto mx-auto rounded-lg border border-border"/>}
               </div>
 
               <div className="flex flex-col gap-3 mb-6">
                 {q.options.map(opt => {
                   const isCurSel  = selected === opt.letter;
-                  const isPrevSel = resp?.letter === opt.letter && !isCurSel;
+                  const isPrevSel = false;
                   return (
                     <button key={opt.letter} onClick={() => handleAnswer(opt.letter)}
                       className={`flex items-start gap-4 p-4 rounded-xl border-2 text-left transition-all duration-150 w-full cursor-pointer active:scale-[.99]
@@ -438,8 +426,8 @@ export default function SimulacroPage() {
                     </button>
                   );
                 })}
-                <button onClick={() => setSelected(null)}
-                  className={`flex items-center gap-3 px-4 py-3 rounded-xl border-2 text-left transition-all text-sm font-medium ${!selected?'border-slate-300 bg-slate-50 text-slate-600':'border-border text-slate-400 hover:border-slate-300 hover:bg-slate-50'}`}>
+                <button onClick={() => handleAnswer(null)}
+                  className={`flex items-center gap-3 px-4 py-3 rounded-xl border-2 text-left transition-all text-sm font-medium ${selected===null?'border-slate-300 bg-slate-50 text-slate-600':'border-border text-slate-400 hover:border-slate-300 hover:bg-slate-50'}`}>
                   <span className="w-7 h-7 rounded-full border-2 border-slate-300 flex items-center justify-center text-xs text-slate-400 shrink-0">—</span>
                   Dejar en blanco
                 </button>
@@ -463,7 +451,7 @@ export default function SimulacroPage() {
                   // perdiendo siempre la última respuesta.
                   // Ahora handleFinish recibe selected directamente como parámetro
                   // y construye la copia local antes de procesar.
-                  <button onClick={() => handleFinish(selected)}
+                  <button onClick={() => handleFinish()}
                     className="px-6 py-2.5 bg-pulse text-ink rounded-full text-sm font-bold hover:brightness-110 hover:-translate-y-0.5 transition-all">
                     Entregar examen →
                   </button>
@@ -477,7 +465,7 @@ export default function SimulacroPage() {
   }
 
   // ─── RESULT ────────────────────────────────────────────
-  if (phase === 'result' && result) return <SimulacroResult result={result} cutoffs={cutoffs} onRepeat={() => setPhase('intro')} />;
+  if (phase === 'result' && result) return <SimulacroResult result={result} cutoffs={cutoffs} onRepeat={() => { finishingRef.current = false; setResult(null); setPhase('intro'); }} />;
 
   return <div className="flex items-center justify-center h-64"><Spinner size="lg"/></div>;
 }
@@ -624,7 +612,7 @@ function SimulacroResult({ result, cutoffs, onRepeat }) {
               <div className="text-center py-8">
                 <div className="text-3xl mb-2">💪</div>
                 <p className="text-sm text-slate-500">Aún no alcanzas el cutoff mínimo de ninguna especialidad.</p>
-                <p className="text-xs text-slate-400 mt-1">El mínimo más bajo registrado es {Math.min(...cutoffs.map(c=>c.min_score)).toFixed(1)} pts.</p>
+                <p className="text-xs text-slate-400 mt-1">El mínimo más bajo registrado es {cutoffs.length ? Math.min(...cutoffs.map(c=>c.min_score)).toFixed(1) + ' pts' : '—'}.</p>
               </div>
             ) : (
               <div className="flex flex-col gap-3">

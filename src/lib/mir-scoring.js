@@ -155,12 +155,17 @@ export function evaluateTime(seconds) {
   return 'very_slow';                  // muy lento
 }
 
+
+// ⚠️ OBSOLETO EN EL CLIENTE: classifyError / sm2 / calcQuality se ejecutan ahora en el servidor
+// (supabase/migrations/002_funciones_base.sql → fn_apply_review). Se conservan solo por
+// compatibilidad con código antiguo; no los uses para escribir resultados.
+
 /**
  * Clasifica el tipo de error
  */
 export function classifyError(isCorrect, correctLetter, chosenLetter, seconds) {
   if (isCorrect) return null;
-  if (seconds < 10) return 'careless';
+  if (seconds < 10) return 'descuido';
   const order  = ['a','b','c','d','e'];
   const idxC   = order.indexOf(correctLetter);
   const idxCh  = order.indexOf(chosenLetter);

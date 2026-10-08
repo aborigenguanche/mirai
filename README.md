@@ -1,95 +1,53 @@
-# MIRai — Fix Package
+# MIRai v3 — paquete completo
 
-## Qué incluye este paquete
+Contiene el código de la app, el SQL de instalación completo, las Edge Functions, las pruebas y la CI.
+Lee antes `docs/MEJORAS.md` (qué está hecho, qué solo escrito pero sin probar, y qué no).
 
-Todos los bugs encontrados y corregidos en la revisión del 11/07/2026.
+## 1. Base de datos — dos caminos
 
----
+**A. Actualizar sin borrar nada (recomendado).** `sql/INSTALL_COMPLETO.sql` es idempotente: crea lo que falta,
+añade columnas, limpia duplicados, **sustituye todas las políticas RLS** y respeta tus datos.
+0. Ejecuta `sql/optional/00_PREFLIGHT.sql` y revisa el resultado (tablas que el instalador no conoce, etc.).
+1. Copia de seguridad (Database → Backups, o `supabase db dump`).
+2. SQL Editor → pega `sql/INSTALL_COMPLETO.sql` → Run (se puede ejecutar varias veces).
+3. Si hace falta, promueve un admin: `UPDATE public.profiles SET role='admin' WHERE email='TU_EMAIL';`
 
-## Estructura de archivos
+**B. Empezar totalmente de cero.** ⚠️ Destructivo. Antes: copia de seguridad y **exporta tus preguntas y la tabla
+`historical_cutoffs`** (el instalador no siembra datos oficiales). Luego: `sql/optional/00_RESET_DESTRUCTIVO.sql` →
+`sql/INSTALL_COMPLETO.sql` → promover admin (arriba) → reimportar preguntas. Las cuentas de `auth.users` se conservan
+y sus perfiles se recrean. **No borres el proyecto de Supabase** (perderías el login con Google, las URL de callback y los usuarios).
 
-```
-src/
-  pages/
-    ExamenPage.jsx       ← bugs #1, #4 corregidos
-    SimulacroPage.jsx    ← bugs #2, #3, #8 corregidos
-    PlanDiaPage.jsx      ← bug #5 corregido
-    PerfilPage.jsx       ← página nueva (no existía)
-    MisErroresPage.jsx   ← reescrita completa (schema viejo)
-  admin/
-    AdminPages.jsx       ← bug #7 corregido
-  lib/
-    supabase.js          ← bugs #9, #10 corregidos
-  store.js               ← refreshProfile añadido
+Probado contra PostgreSQL real: instalación limpia, segunda ejecución, actualización de una BD antigua con datos,
+y reset + reinstalación (`sql/tests/`).
 
-supabase/
-  functions/
-    delete-user/
-      index.ts           ← Edge Function nueva (bug #7)
-```
+## 2. Código
+- Copia `src/` encima de tu proyecto. Borra lo obsoleto: `pages/app/PracticarPage.jsx`, la carpeta `src/store/`
+  (queda `src/store.js`), `hooks/useSpacedRepetition*` y `lib/spaced-repetition*`.
+- `.env`: `VITE_SUPABASE_URL` y `VITE_SUPABASE_ANON_KEY` (ver `.env.example`; también en Vercel → Environment Variables).
+- Tests: `npm i -D vitest` y en `package.json` → `"scripts": { "test": "vitest run" }`.
+- Supabase → Authentication → URL Configuration: Site URL y Redirect URLs con tu dominio de Vercel.
 
----
+## 3. Cambios de comportamiento que debes conocer
+- Los usuarios **ya no escriben resultados**: cualquier página que lo hiciera directamente fallará.
+  Solo se ha eliminado un export (`updateWeakSpecialties`); `saveResponses`/`upsertQuestionState` lanzan un error explicativo.
+- Un usuario sin acceso vigente no ve el banco (es lo previsto: el paywall).
+- El plan "anual" es un pago único con acceso hasta el MIR (+7 días). Los importes del modal (`PaywallModal.jsx`) son
+  orientativos: deben coincidir con los precios de Stripe.
+- Errores nuevos se guardan como `descuido` / `confusion` / `conceptual`.
 
-## Bugs corregidos
+## 4. Stripe y emails (opcionales, **sin probar contra los servicios reales**)
+`supabase/functions/README.md`. Mientras no estén desplegados, el paywall registra la solicitud en
+`subscription_requests` y activas el plan a mano desde `/admin/usuarios`.
 
-### 🔴 Críticos
+## 5. Prueba de humo tras instalar (10 min)
+1. Cuenta normal: `await supabase.from('profiles').update({role:'admin'}).eq('id', …)` → **debe fallar**.
+2. Cuenta nueva con Google → onboarding → `/app/plan`.
+3. Sesión de estudio: responde, falla alguna → aparece la explicación y luego en Mis errores.
+4. F5 en mitad de una sesión → se recupera. F5 en mitad de un simulacro → se recupera y el reloj sigue.
+5. SQL: `UPDATE profiles SET trial_ends_at = now() - interval '1 day' WHERE email='…'` → recarga → paywall; las preguntas desaparecen.
+6. Importa un CSV con una explicación con salto de línea; prueba una fila con la letra correcta ausente (debe rechazarla).
+7. Admin: Analytics, Moderación, crear usuario (tu sesión no debe cambiar) y borrar usuario.
 
-| # | Bug | Archivo |
-|---|---|---|
-| 1 | `persistSession` se ejecutaba dos veces (review + result) | ExamenPage.jsx |
-| 2 | Última pregunta del simulacro siempre se perdía | SimulacroPage.jsx |
-| 3 | `handleFinish` podía ejecutarse dos veces (timer + botón) | SimulacroPage.jsx |
-
-### 🟡 Medios
-
-| # | Bug | Archivo |
-|---|---|---|
-| 4 | `createSession` siempre guardaba mode: 'study' | ExamenPage.jsx |
-| 5 | PlanDiaPage no recargaba al cambiar perfil | PlanDiaPage.jsx |
-| 6 | fechaMir no sincronizaba con perfil actualizado | MisErroresPage.jsx |
-| 7 | Admin delete solo borraba profiles, no auth.users | AdminPages.jsx + Edge Function |
-
-### 🟠 Menores
-
-| # | Bug | Archivo |
-|---|---|---|
-| 8 | Especialidades del simulacro se cargaban secuencialmente | SimulacroPage.jsx |
-| 9 | getUserAnalytics llamaba a RPC inexistente | supabase.js |
-| 10 | fetchSpecialties sin caché (4 requests por página) | supabase.js |
-
----
-
-## Pasos de instalación
-
-### 1. Copiar archivos src
-Reemplaza los archivos existentes con los de este paquete. Las rutas
-relativas son las mismas que en tu proyecto.
-
-### 2. Fix del trigger en Supabase (ya aplicado en BD)
-El trigger `update_weekly_ranking` tenía un conflicto de nombres que
-hacía rollback de todos los inserts en `exam_responses`. Ya está
-corregido directamente en la BD — no necesitas hacer nada.
-
-### 3. Deploy la Edge Function delete-user
-```bash
-supabase functions deploy delete-user
-```
-
-### 4. Políticas RLS (ya aplicadas en BD)
-Las siguientes políticas ya fueron añadidas durante la sesión:
-- `exam_responses`: INSERT y SELECT para usuario propietario
-- `user_question_state`: ALL para usuario propietario
-- `exam_sessions`: ALL para usuario propietario
-
-### 5. Borrar PracticarPage.jsx
-Este archivo usa el schema antiguo (`intentos`, `sesiones`, `preguntas`)
-que no existe en la BD actual. Bórralo — ExamenPage.jsx lo reemplaza.
-
----
-
-## Nota sobre sesiones históricas
-
-Las 13 sesiones anteriores al fix del trigger quedaron sin
-`exam_responses` asociadas. Los datos de tasa de acierto partirán
-de 0 y se irán acumulando con las nuevas sesiones. No es recuperable.
-
+## 6. Sin auditar (nunca vi su código)
+`AppPages.jsx` (probablemente Ranking, Notificaciones, Estadísticas, Notas), `LoginPage`, `CheckoutPage`,
+`DashboardPage`, `PreguntasPage`, `components/ui`. Súbelos y los reviso.

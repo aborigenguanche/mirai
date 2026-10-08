@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { supabase, countRepasoPendiente, getMostFailed, fetchSpecialties, getAppConfig } from '../../lib/supabase';
+import { supabase, countRepasoPendiente, countFailedQuestions, fetchSpecialties, getAppConfig } from '../../lib/supabase';
 import { useAuthStore } from '../../store';
+import CoachIA from '../../components/coach/CoachIA';
 import { Card, CardHeader, StatCard, LoadingScreen } from '../../components/ui';
 
 export default function PlanDiaPage() {
@@ -19,46 +20,30 @@ export default function PlanDiaPage() {
   // Si el usuario guarda fecha_mir o weak_specialties en PerfilPage y vuelve aquí,
   // el plan seguía mostrando "Configura tu fecha" aunque ya estuviera guardada.
   // Ahora se recarga cuando cambian los datos del perfil relevantes para el plan.
-  useEffect(() => { load(); }, [profile.fecha_mir, profile.weak_specialties]);
+  useEffect(() => { load(); }, [profile.weak_specialties]);
 
   async function load() {
     setLoading(true);
     const uid    = profile.id;
     const dias30 = new Date(Date.now() - 30 * 86400000).toISOString();
 
-    // FIX: Eliminada la llamada a supabase.rpc('get_user_analytics') porque
-    // esa función SQL no existe en la BD. La tasa se calcula directamente
-    // desde exam_responses, que sí existe y tiene los datos reales.
-    const [pend, sessHist, falladasCount, respuestas30d] = await Promise.all([
+    // Conteos exactos en el servidor (sin el límite de 1.000 filas de PostgREST)
+    const countResp = (onlyCorrect) => {
+      let q = supabase.from('exam_responses').select('*', { count: 'exact', head: true })
+        .eq('user_id', uid).gte('answered_at', dias30);
+      if (onlyCorrect) q = q.eq('is_correct', true);
+      return q.then(r => r.count || 0);
+    };
+    const [pend, sessHist, falladasCount, total30, correct30] = await Promise.all([
       countRepasoPendiente(uid),
-
       supabase.from('exam_sessions')
-        .select('started_at')
-        .eq('user_id', uid)
-        .not('finished_at', 'is', null)
-        .order('started_at', { ascending: false })
-        .limit(120)
-        .then(r => r.data || []),
-
-      // Total real de preguntas falladas (para el bloque de refuerzo)
-      supabase.from('exam_responses')
-        .select('*', { count: 'exact', head: true })
-        .eq('user_id', uid)
-        .eq('is_correct', false)
-        .then(r => r.count || 0),
-
-      // Respuestas de los últimos 30 días para calcular la tasa real
-      supabase.from('exam_responses')
-        .select('is_correct')
-        .eq('user_id', uid)
-        .gte('answered_at', dias30)
-        .then(r => r.data || []),
+        .select('started_at').eq('user_id', uid).not('finished_at', 'is', null)
+        .order('started_at', { ascending: false }).limit(120).then(r => r.data || []),
+      countFailedQuestions(uid),          // preguntas DISTINTAS falladas (no respuestas repetidas)
+      countResp(false),
+      countResp(true),
     ]);
-
-    // Tasa de acierto real (últimos 30 días)
-    const total30   = respuestas30d.length;
-    const correct30 = respuestas30d.filter(r => r.is_correct).length;
-    const tasaReal  = total30 > 0 ? Math.round((correct30 / total30) * 100) : 0;
+    const tasaReal = total30 > 0 ? Math.round((correct30 / total30) * 100) : 0;
 
     // Racha de días consecutivos con sesión
     const diasSet = new Set(sessHist.map(s => new Date(s.started_at).toDateString()));
@@ -136,15 +121,6 @@ export default function PlanDiaPage() {
     coachType = tasa >= 65 ? 'positivo' : 'neutro';
   }
 
-  const COACH_STYLE = {
-    urgente:  { bg:'bg-red-50',   border:'border-red-200',      icon:'🚨', text:'text-red-600' },
-    alerta:   { bg:'bg-amber-50', border:'border-amber-200',    icon:'⚠️', text:'text-amber-700' },
-    consejo:  { bg:'bg-sky-50',   border:'border-sky-200',      icon:'💡', text:'text-sky-700' },
-    positivo: { bg:'bg-pulse-bg', border:'border-pulse-dim/30', icon:'✓',  text:'text-pulse-dim' },
-    neutro:   { bg:'bg-surface',  border:'border-border',       icon:'📊', text:'text-slate-600' },
-  };
-  const cs = COACH_STYLE[coachType];
-
   const primeraSpec    = weakSpecs[0];
   const examLinkNuevas = primeraSpec
     ? `/app/examen?especialidad=${primeraSpec.id}`
@@ -172,20 +148,7 @@ export default function PlanDiaPage() {
       </div>
 
       {/* Coach IA */}
-      <div className={`rounded-xl p-5 mb-6 border ${cs.bg} ${cs.border} flex items-start gap-4`}>
-        <div className="w-10 h-10 bg-ink rounded-full flex items-center justify-center shrink-0">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-            <path d="M2 12h4l2-7 4 14 3-9 2 4h5" stroke="#00E5C7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </div>
-        <div className="flex-1">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="font-mono text-[0.65rem] font-semibold uppercase tracking-widest text-slate-400">Coach IA</span>
-            <span className="w-1.5 h-1.5 rounded-full bg-pulse animate-pulse-dot"/>
-          </div>
-          <p className={`text-sm font-medium leading-relaxed ${cs.text}`}>{cs.icon} {coachMsg}</p>
-        </div>
-      </div>
+      <CoachIA message={coachMsg} type={coachType} />
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">

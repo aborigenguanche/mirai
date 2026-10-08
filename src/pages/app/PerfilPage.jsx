@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { supabase, fetchSpecialties } from '../../lib/supabase';
+import { supabase, fetchSpecialties, getAppConfig, exportMyData, deleteMyAccount, signOut, reportError } from '../../lib/supabase';
 import { useAuthStore } from '../../store';
 import { toast } from '../../store';
 import { Badge, LoadingScreen, Button, FormGroup, Input, Card, CardHeader } from '../../components/ui';
@@ -21,10 +21,10 @@ export default function PerfilPage() {
   const [saving, setSaving]     = useState(false);
   const [avatarUrl, setAvatarUrl] = useState(null);
   const [weakSpecNames, setWeakSpecNames] = useState([]);
+  const [fechaMir, setFechaMir] = useState(null); // fecha global (la gestiona el admin)
 
   const [form, setForm] = useState({
     full_name:      '',
-    fecha_mir:      '',
     baseline_score: '',
   });
 
@@ -45,10 +45,10 @@ export default function PerfilPage() {
       (allSpecs || []).filter(s => ids.includes(s.id)).map(s => s.name)
     );
 
+    setFechaMir(await getAppConfig('fecha_mir'));
+
     setForm({
       full_name:      profile.full_name      || '',
-      // fecha_mir es tipo date en Supabase → no necesita split('T')
-      fecha_mir:      profile.fecha_mir      || '',
       baseline_score: profile.baseline_score != null ? String(profile.baseline_score) : '',
     });
 
@@ -67,8 +67,6 @@ export default function PerfilPage() {
 
     const payload = {
       full_name:      form.full_name      || null,
-      // fecha_mir es date, acepta 'YYYY-MM-DD' directamente sin conversión ISO
-      fecha_mir:      form.fecha_mir      || null,
       baseline_score: form.baseline_score ? parseFloat(form.baseline_score) : null,
     };
 
@@ -93,6 +91,38 @@ export default function PerfilPage() {
 
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }));
 
+  // Cuenta y privacidad
+  const [delOpen, setDelOpen]   = useState(false);
+  const [delText, setDelText]   = useState('');
+  const [busy, setBusy]         = useState(false);
+
+  async function openPortal() {
+    setBusy(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('create-portal-session');
+      if (error || !data?.url) throw new Error(data?.error || error?.message || 'Portal no disponible');
+      window.location.href = data.url;
+    } catch (e) { toast.error('No se pudo abrir el portal de suscripción'); reportError(e); }
+    finally { setBusy(false); }
+  }
+  async function downloadMyData() {
+    setBusy(true);
+    try {
+      const data = await exportMyData();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `mirai-mis-datos-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click(); URL.revokeObjectURL(a.href);
+    } catch (e) { toast.error('No se pudieron exportar tus datos'); reportError(e); }
+    finally { setBusy(false); }
+  }
+  async function deleteAccount() {
+    setBusy(true);
+    try { await deleteMyAccount(); await signOut(); }
+    catch (e) { toast.error(e.message || 'No se pudo eliminar la cuenta'); setBusy(false); }
+  }
+
   if (loading) return <LoadingScreen message="Cargando perfil..." />;
 
   const iniciales = (profile.full_name || profile.email || 'U')
@@ -106,7 +136,7 @@ export default function PerfilPage() {
   const createdAt   = new Date(profile.created_at).toLocaleDateString('es-ES', { day:'2-digit', month:'long', year:'numeric' });
 
   // Días al MIR
-  const mirDate   = profile.fecha_mir ? new Date(profile.fecha_mir) : null;
+  const mirDate   = fechaMir ? new Date(fechaMir) : null;
   const diasAlMir = mirDate ? Math.max(0, Math.ceil((mirDate - new Date()) / 86400000)) : null;
 
   return (
@@ -193,39 +223,25 @@ export default function PerfilPage() {
           <Card>
             <CardHeader title="Configuración MIR" subtitle="Datos clave para personalizar tu plan de estudio" />
 
-            <FormGroup
-              label="Fecha del examen MIR"
-              hint="El Coach IA y la cuenta atrás usan esta fecha">
-              <Input
-                type="date"
-                value={form.fecha_mir}
-                onChange={e => f('fecha_mir', e.target.value)}
-              />
-            </FormGroup>
-
-            {/* Preview de cuenta atrás */}
-            {form.fecha_mir && (
+            {/* Fecha MIR — global, la gestiona el equipo de MIRai (solo lectura) */}
+            {mirDate ? (
               <div className={`flex items-center gap-3 p-4 rounded-lg border mb-4 ${
-                diasAlMir !== null && diasAlMir < 30 ? 'bg-red-50 border-red-200' :
-                diasAlMir !== null && diasAlMir < 90 ? 'bg-amber-50 border-amber-200' :
+                diasAlMir < 30 ? 'bg-red-50 border-red-200' :
+                diasAlMir < 90 ? 'bg-amber-50 border-amber-200' :
                 'bg-sky-50 border-sky-200'}`}>
                 <div className={`font-display font-bold text-3xl ${
-                  diasAlMir !== null && diasAlMir < 30 ? 'text-red-500' :
-                  diasAlMir !== null && diasAlMir < 90 ? 'text-amber-500' :
-                  'text-sky-600'}`}>
-                  {(() => {
-                    const d = new Date(form.fecha_mir);
-                    const diff = Math.max(0, Math.ceil((d - new Date()) / 86400000));
-                    return diff;
-                  })()}
+                  diasAlMir < 30 ? 'text-red-500' : diasAlMir < 90 ? 'text-amber-500' : 'text-sky-600'}`}>
+                  {diasAlMir}
                 </div>
                 <div>
                   <div className="text-sm font-semibold text-ink">días para el MIR</div>
                   <div className="text-xs text-slate-400">
-                    {new Date(form.fecha_mir).toLocaleDateString('es-ES', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}
+                    {mirDate.toLocaleDateString('es-ES', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}
                   </div>
                 </div>
               </div>
+            ) : (
+              <p className="text-xs text-slate-400 mb-4">La fecha de la convocatoria MIR aún no está publicada.</p>
             )}
 
             <FormGroup
@@ -271,6 +287,36 @@ export default function PerfilPage() {
               Guardar cambios
             </Button>
           </div>
+
+          {/* Cuenta y privacidad */}
+          <Card>
+            <CardHeader title="Cuenta y privacidad" subtitle="Gestiona tu suscripción y tus datos" />
+            <div className="flex flex-col gap-3">
+              {profile.stripe_customer_id && (
+                <Button variant="secondary" onClick={openPortal} loading={busy}>Gestionar suscripción y facturas</Button>
+              )}
+              <Button variant="secondary" onClick={downloadMyData} loading={busy}>Descargar mis datos (JSON)</Button>
+              {profile.role !== 'admin' && !delOpen && (
+                <button onClick={() => setDelOpen(true)} className="text-xs text-red-400 hover:text-red-600 font-semibold text-left transition-colors">
+                  Eliminar mi cuenta…
+                </button>
+              )}
+              {delOpen && (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <p className="text-sm text-red-700 mb-3">
+                    Se borrarán tu cuenta, tu progreso, tus notas y tu historial. <strong>No se puede deshacer.</strong>{' '}
+                    Escribe <strong>ELIMINAR</strong> para confirmar.
+                  </p>
+                  <input value={delText} onChange={e => setDelText(e.target.value)} placeholder="ELIMINAR"
+                    className="w-full px-3 py-2 border border-red-200 rounded-md text-sm bg-white outline-none mb-3"/>
+                  <div className="flex gap-2 justify-end">
+                    <Button variant="secondary" size="sm" onClick={() => { setDelOpen(false); setDelText(''); }}>Cancelar</Button>
+                    <Button variant="danger" size="sm" onClick={deleteAccount} loading={busy} disabled={delText !== 'ELIMINAR'}>Eliminar definitivamente</Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </Card>
         </div>
 
         {/* Columna derecha: solo lectura */}
@@ -318,10 +364,7 @@ export default function PerfilPage() {
 
               <div className="pt-2 border-t border-border">
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  Para cambiar tu plan o resolver incidencias contacta con{' '}
-                  <a href="mailto:info@alisoralabs.com" className="text-sky-500 hover:underline font-medium">
-                    info@alisoralabs.com
-                  </a>
+                  Para cambiar tu plan o resolver incidencias, contacta con el equipo de MIRai.{/* TODO: añadir email de soporte real */}
                 </p>
               </div>
             </div>

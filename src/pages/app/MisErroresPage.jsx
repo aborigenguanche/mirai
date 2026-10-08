@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { supabase, getMostFailed, countRepasoPendiente } from '../../lib/supabase';
+import { supabase, getMostFailed, countRepasoPendiente, getAppConfig } from '../../lib/supabase';
 import { useAuthStore } from '../../store';
 import { toast } from '../../store';
 import { Card, CardHeader, Badge, EmptyState, LoadingScreen } from '../../components/ui';
@@ -38,6 +38,9 @@ const TIPO_INFO = {
   },
 };
 
+// Los errores antiguos se guardaron como 'careless'; la UI usa 'descuido'
+const normTipo = t => (t === 'careless' ? 'descuido' : t);
+
 // Convierte difficulty numérico al label y variante del badge
 function difficultyBadge(d) {
   if (!d) return null;
@@ -56,21 +59,14 @@ export default function MisErroresPage() {
   const [pendientes, setPendientes]   = useState(0);
   const [tabActivo, setTabActivo]     = useState('resumen');
   const [expandida, setExpandida]     = useState(null);
-  const [fechaMir, setFechaMir]       = useState(profile.fecha_mir || '');
-  const [savingFecha, setSavingFecha] = useState(false);
+  const [fechaMir, setFechaMir]       = useState(''); // fecha global del admin
 
   useEffect(() => { loadData(); }, []);
-
-  // BUG 6 FIX: fechaMir solo tomaba el valor inicial del profile.
-  // Si el usuario actualizaba la fecha desde PerfilPage y volvía aquí,
-  // el input seguía mostrando el valor viejo hasta recargar la página.
-  useEffect(() => {
-    setFechaMir(profile.fecha_mir || '');
-  }, [profile.fecha_mir]);
 
   async function loadData() {
     setLoading(true);
     const uid = profile.id;
+    setFechaMir((await getAppConfig('fecha_mir')) || '');
 
     // FIX: eliminado useSpacedRepetition — ahora usa getMostFailed y countRepasoPendiente
     // del schema nuevo (user_question_state + questions + specialties)
@@ -87,7 +83,7 @@ export default function MisErroresPage() {
 
     falladas.forEach(item => {
       total += item.times_wrong;
-      const tipo    = item.last_error_type;
+      const tipo    = normTipo(item.last_error_type);
       const espName = item.question?.specialty?.name || 'Sin especialidad';
 
       if (tipo && porTipo[tipo] !== undefined) porTipo[tipo] += item.times_wrong;
@@ -107,23 +103,6 @@ export default function MisErroresPage() {
     setMasFalladas(falladas.slice(0, 50));
     setPendientes(pend);
     setLoading(false);
-  }
-
-  async function saveFechaMir() {
-    setSavingFecha(true);
-    // FIX: era `usuarios` table, ahora es `profiles`
-    const { error } = await supabase
-      .from('profiles')
-      .update({ fecha_mir: fechaMir || null })
-      .eq('id', profile.id);
-
-    if (error) {
-      toast.error('Error al guardar la fecha');
-    } else {
-      toast.success('Fecha del MIR guardada');
-      if (typeof refreshProfile === 'function') await refreshProfile();
-    }
-    setSavingFecha(false);
   }
 
   if (loading) return <LoadingScreen message="Analizando tus errores..." />;
@@ -178,16 +157,8 @@ export default function MisErroresPage() {
                 </span>
               </div>
             ) : (
-              <div className="text-white/60 text-sm">Configura la fecha del MIR para ver tu cuenta atrás</div>
+              <div className="text-white/60 text-sm">La fecha de la convocatoria MIR aún no está publicada</div>
             )}
-          </div>
-          <div className="flex items-center gap-2">
-            <input type="date" value={fechaMir} onChange={e => setFechaMir(e.target.value)}
-              className="px-3 py-2 rounded-lg border border-white/20 bg-white/10 text-white text-sm outline-none focus:border-pulse/60 transition-all"/>
-            <button onClick={saveFechaMir} disabled={savingFecha}
-              className="px-4 py-2 bg-pulse text-ink rounded-lg text-sm font-bold hover:brightness-110 transition-all disabled:opacity-50">
-              {savingFecha ? '...' : 'Guardar'}
-            </button>
           </div>
         </div>
       </div>
@@ -388,7 +359,7 @@ export default function MisErroresPage() {
                     const isOpen   = expandida === item.question_id;
                     const total    = item.times_wrong + item.times_correct;
                     const tasaAc   = total > 0 ? Math.round((item.times_correct / total) * 100) : 0;
-                    const tipoInfo = item.last_error_type ? TIPO_INFO[item.last_error_type] : null;
+                    const tipoInfo = item.last_error_type ? TIPO_INFO[normTipo(item.last_error_type)] : null;
                     const diff     = difficultyBadge(p.difficulty);
 
                     return (
